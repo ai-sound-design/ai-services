@@ -1,0 +1,256 @@
+# Backend services for the AI Sound Design Pro Tools plugin.
+#
+#   docker compose up -d          # build what is missing and start everything
+#   docker compose logs -f        # follow logs
+#   docker compose down           # stop
+#
+# Every value has a working default; copy .env.example to .env to change one.
+#
+# Three kinds of service, one folder each:
+#   generation/   video (or prompt) in, audio out         mmaudio-api   :8000
+#   search/       video or prompt in, indexed sounds out  sound-search-api :8002
+#   spotting/     video range in, sound events out        spotting-api  :8003
+#   hybrid/       video range in, one sound per event out hybrid-api    :8004
+#
+# Spotting needs a vision-language model. By default an Ollama container is part
+# of the stack; set BUNDLED_OLLAMA=0 in .env to use an Ollama (or any other
+# OpenAI-compatible server) that already runs on this machine, see VLM_URL.
+#
+# No host paths are required, so this file works unchanged on Windows, macOS and
+# Linux. Model weights persist in named volumes and survive rebuilds.
+
+name: ai-sound-services
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+x-database-url: &database-url
+  postgresql://${POSTGRES_USER:-sound_user}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-sounds}
+
+services:
+
+  # ── Generation: MMAudio, the reference implementation ──────────────────────
+  # Any other model can take its place: see generation/README.md.
+  mmaudio-api:
+    build:
+      context: .
+      dockerfile: generation/mmaudio/Dockerfile
+    image: ai-sound-design/mmaudio-api:latest
+    restart: unless-stopped
+    ports:
+      - "${MMAUDIO_PORT:-8000}:8000"
+    environment:
+      API_PORT: 8000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      FORCE_DEVICE: ${FORCE_DEVICE:-auto}
+      FORCE_DTYPE: ${FORCE_DTYPE:-bfloat16}
+      VIDEO_CACHE_MAX_GB: ${VIDEO_CACHE_MAX_GB:-8}
+      VIDEO_CACHE_TTL_MIN: ${VIDEO_CACHE_TTL_MIN:-60}
+      ENABLE_TRACEMALLOC: ${ENABLE_TRACEMALLOC:-false}
+      # Fetch the model at container start instead of on the first request.
+      # Set to 0 only to debug a start-up problem.
+      MMAUDIO_PREFETCH: ${MMAUDIO_PREFETCH:-1}
+      MMAUDIO_MODEL: ${MMAUDIO_MODEL:-large_44k_v2}
+    volumes:
+      # The entrypoint downloads the weights before the server starts, so they
+      # are on disk before the first request. MMAudio resolves its checkpoint
+      # paths relative to the working directory: they must be mounted at
+      # /app/api, not under /opt/MMAudio.
+      - mmaudio-weights:/app/api/weights
+      - mmaudio-ext-weights:/app/api/ext_weights
+      - hf-cache:/cache/huggingface
+      - torch-cache:/cache/torch
+    # Shared memory for PyTorch dataloaders; the 64 MB default is too small.
+    shm_size: "2gb"
+    <<: *gpu
+
+  # ── PostgreSQL with pgvector: the sound index ──────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sounds}
+      POSTGRES_USER: ${POSTGRES_USER:-sound_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Executed once, on the first start with an empty data volume. The API
+      # and the indexer apply the same file on start, so it is safe to change.
+      - ./search/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sound_user} -d ${POSTGRES_DB:-sounds}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Search API: X-CLIP retrieval over every indexed library ────────────────
+  sound-search-api:
+    build:
+      context: .
+      dockerfile: search/api/Dockerfile
+    image: ai-sound-design/sound-search-api:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${SOUND_SEARCH_PORT:-8002}:8002"
+    environment:
+      DATABASE_URL: *database-url
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # on_demand: fetch a sound from its media URL on first use (BBC archive
+      #            searchable without downloading it). local_only: only sounds
+      #            already on disk, for machines without internet access.
+      AUDIO_FETCH: ${AUDIO_FETCH:-on_demand}
+      # Audio embeddings for the search by sound; the same model the indexer used.
+      CLAP_MODEL: ${CLAP_MODEL:-laion/clap-htsat-fused}
+    volumes:
+      # Plain host folders so the audio is visible in Explorer/Finder.
+      - ${AUDIO_HOST_DIR:-./data/audio}:/data/audio
+      - ${LIBRARIES_HOST_DIR:-./data/libraries}:/data/libraries:ro
+      - hf-cache:/cache/huggingface
+    shm_size: "1gb"
+    <<: *gpu
+
+  # ── Indexer: one-shot jobs, not started by "compose up" ────────────────────
+  # Your own sounds (a folder per library under LIBRARIES_HOST_DIR):
+  #   docker compose run --rm indexer python index_folder.py <library-name>
+  # The BBC archive (see search/README.md):
+  #   docker compose run --rm indexer python sources/bbc/harvest.py
+  #   docker compose run --rm indexer python embed.py --library bbc
+  #   docker compose run --rm indexer python sources/bbc/download.py   # offline use only
+#   docker compose run --rm indexer python embed_audio.py             # search by sound, needs the files
+  indexer:
+    build:
+      context: .
+      dockerfile: search/indexer/Dockerfile
+    image: ai-sound-design/indexer:latest
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: *database-url
+      BBC_AUDIO_FORMAT: ${BBC_AUDIO_FORMAT:-mp3}
+      CLAP_MODEL: ${CLAP_MODEL:-laion/clap-htsat-fused}
+    volumes:
+      - ${AUDIO_HOST_DIR:-./data/audio}:/data/audio
+      - ${LIBRARIES_HOST_DIR:-./data/libraries}:/data/libraries:ro
+      - hf-cache:/cache/huggingface
+    <<: *gpu
+
+  # ── Ollama: hosts the vision-language model for spotting ───────────────────
+  # BUNDLED_OLLAMA=0 in .env leaves this container out (replicas: 0); spotting
+  # then talks to whatever VLM_URL names. Point OLLAMA_MODELS_HOST_DIR at an
+  # existing Ollama model store (for example C:/Users/<you>/.ollama on Windows)
+  # and the container uses those weights instead of downloading them again. The
+  # default is an empty folder next to this file; the command below pulls
+  # VLM_MODEL into it on first start.
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11435}:11434"
+    environment:
+      # Keep the model resident: a cold load with the 32k context takes minutes.
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-1h}
+    volumes:
+      - ${OLLAMA_MODELS_HOST_DIR:-./data/ollama}:/root/.ollama
+    entrypoint: ["/bin/sh", "-c"]
+    # Serve, wait for the API, make sure the model is present, then keep serving.
+    command:
+      - |
+        ollama serve &
+        until ollama list >/dev/null 2>&1; do sleep 1; done
+        ollama list | grep -q "^${VLM_MODEL:-gemma4:e4b-it-qat}" || ollama pull "${VLM_MODEL:-gemma4:e4b-it-qat}"
+        wait
+    healthcheck:
+      # Healthy only once the model is present, so spotting does not start
+      # against an Ollama that is still pulling it.
+      test: ["CMD-SHELL", "ollama list | grep -q '^${VLM_MODEL:-gemma4:e4b-it-qat}'"]
+      interval: 15s
+      timeout: 10s
+      start_period: 900s
+      retries: 5
+    deploy:
+      replicas: ${BUNDLED_OLLAMA:-1}
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Spotting API: video range → sound events with timecodes ────────────────
+  # Talks to the model over VLM_URL. With BUNDLED_OLLAMA=0 set VLM_URL to the
+  # server on the host, e.g. http://host.docker.internal:11434 for Ollama
+  # (started with OLLAMA_HOST=0.0.0.0, since it binds to localhost only by
+  # default) or http://host.docker.internal:1234 with VLM_API=openai for LM Studio.
+  spotting-api:
+    build:
+      context: .
+      dockerfile: spotting/api/Dockerfile
+    image: ai-sound-design/spotting-api:latest
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+        required: false
+    ports:
+      - "${SPOTTING_PORT:-8003}:8003"
+    environment:
+      VLM_URL: ${VLM_URL:-http://ollama:11434}
+      VLM_MODEL: ${VLM_MODEL:-gemma4:e4b-it-qat}
+      VLM_API: ${VLM_API:-ollama}
+      SAMPLE_FPS: ${SPOTTING_SAMPLE_FPS:-2}
+      FRAMES_PER_CALL: ${SPOTTING_FRAMES_PER_CALL:-8}
+      VLM_NUM_CTX: ${VLM_NUM_CTX:-32768}
+      FRAME_STAMP: ${FRAME_STAMP:-1}
+      VLM_TEMPERATURE: ${VLM_TEMPERATURE:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── Hybrid API: one generated sound per sound event ────────────────────────
+  # Composes spotting-api, mmaudio-api and (for library matches) sound-search-api;
+  # no model of its own, no GPU.
+  hybrid-api:
+    build:
+      context: .
+      dockerfile: hybrid/api/Dockerfile
+    image: ai-sound-design/hybrid-api:latest
+    restart: unless-stopped
+    depends_on:
+      mmaudio-api:
+        condition: service_started
+      spotting-api:
+        condition: service_started
+      sound-search-api:
+        condition: service_started
+    ports:
+      - "${HYBRID_PORT:-8004}:8004"
+    environment:
+      GENERATION_URL: http://mmaudio-api:8000
+      SPOTTING_URL: http://spotting-api:8003
+      SEARCH_URL: http://sound-search-api:8002
+      GEN_MIN_SECONDS: ${HYBRID_GEN_MIN_SECONDS:-4}
+      GEN_MAX_SECONDS: ${HYBRID_GEN_MAX_SECONDS:-12}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - hybrid-output:/data/hybrid
+
+volumes:
+  hybrid-output:
+  mmaudio-weights:
+  mmaudio-ext-weights:
+  hf-cache:
+  torch-cache:
+  postgres-data:
