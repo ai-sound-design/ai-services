@@ -1,0 +1,9 @@
+# API layer only. Model dependencies come from MMAudio's own install
+# (pip install -e /opt/MMAudio in the Dockerfile). Pinned so a rebuild resolves
+# the same versions instead of backtracking through the index.
+
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+python-multipart==0.0.32
+psutil==6.1.0
+nvidia-ml-py3==7.352.0

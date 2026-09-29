@@ -1,0 +1,9 @@
+# Scripts and configuration run inside Linux containers: always LF, whatever the host.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.sql text eol=lf
+*.md text eol=lf
+*.mp4 binary
+*.wav binary

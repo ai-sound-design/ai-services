@@ -1,0 +1,7 @@
+.env
+*.log
+__pycache__/
+*.py[cod]
+outputs/
+data/
+examples/videos/
