@@ -1082,7 +1082,7 @@ async def generate_audio(
                 raise HTTPException(status_code=400, detail=f"Video too long: {duration:.2f}s (maximum 12s)")
             
             # Load and process video using MMAudio's native function
-            video_info = load_video_optimized(tmp_video_path, duration)
+            video_info = await asyncio.to_thread(load_video_optimized, tmp_video_path, duration)   # decoding off the event loop
             
             # Exact logic from demo.py for video processing
             clip_frames = video_info.clip_frames
@@ -1105,7 +1105,7 @@ async def generate_audio(
         
         # Load model with correct dtype from the start (dtype-aware caching)
         # This ensures weights are loaded in the correct precision
-        net, feature_utils, seq_cfg = get_cached_model(model_name, target_dtype=target_dtype)
+        net, feature_utils, seq_cfg = await asyncio.to_thread(get_cached_model, model_name, target_dtype=target_dtype)   # a cold load takes long
         
         # CRITICAL: Convert video tensors to target dtype (only for V2A mode)
         # Cached video_info is in bfloat16, but we need float32 for full precision
@@ -1140,15 +1140,21 @@ async def generate_audio(
             try:
                 # Generate audio with no_grad (like demo.py)
                 # Note: generate() function returns audio-only by default (no video composite)
-                with torch.no_grad():
-                    audios = generate(clip_frames,
-                                      sync_frames, [prompt],
-                                      negative_text=[negative_prompt] if negative_prompt else None,
-                                      feature_utils=feature_utils,
-                                      net=net,
-                                      fm=fm,
-                                      rng=rng,
-                                      cfg_strength=cfg_strength)
+                # In a worker thread: the model call takes many seconds and would otherwise
+                # hold the event loop, so /health (and every other request) went unanswered
+                # while a sound was generated and the plugin greyed the mode out.
+                def run_model():
+                    with torch.no_grad():
+                        return generate(clip_frames,
+                                        sync_frames, [prompt],
+                                        negative_text=[negative_prompt] if negative_prompt else None,
+                                        feature_utils=feature_utils,
+                                        net=net,
+                                        fm=fm,
+                                        rng=rng,
+                                        cfg_strength=cfg_strength)
+
+                audios = await asyncio.to_thread(run_model)
             finally:
                 active_requests -= 1
                 logger.info(f"🔓 GPU lock released (pending: {pending_requests}, active: {active_requests})")
