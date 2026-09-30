@@ -185,8 +185,10 @@ async def fetch_snippet(client: httpx.AsyncClient, search_url: str, sound_id: in
 async def match_generated(generated: Path, work: Path, *, search_url: str, text: str, settings: dict[str, Any],
                           category: Optional[str], on_progress=None) -> list[dict[str, Any]]:
     """Pieces of library recordings that replace `generated`. Each piece:
-    {layer, start_seconds, length_seconds, sound_id, library, external_id, description,
-     offset_seconds, similarity, path}. `start_seconds` is relative to the generated sound."""
+    {layer, start_seconds, length_seconds, handle_before_seconds, handle_after_seconds,
+     sound_id, library, external_id, description, offset_seconds, similarity, path}.
+    `start_seconds` is relative to the generated sound; the file holds the handles too,
+    so it starts `handle_before_seconds` before that."""
     samples = decode(generated)
     duration = len(samples) / SAMPLE_RATE
     min_piece = float(settings.get("min_piece_seconds", 2.0))
@@ -253,17 +255,33 @@ async def match_generated(generated: Path, work: Path, *, search_url: str, text:
         chosen = [c if c and float(c["similarity"]) >= min_similarity else None for c in chosen]
         rows = [chosen] + choose_layers(candidates, chosen, layers, min_similarity)
 
+        # Handles: extra seconds of the recording before and after the matched stretch
+        # (an ambience needs them for a fade), as far as the recording reaches.
+        handle = max(0.0, float(settings.get("handle_seconds", 0.0)))
+        # An event longer than the generated sound (the generation model has a maximum
+        # length): a recording that matched the sound as a whole is cut in the length of
+        # the event instead, as far as it reaches, so a two-minute room tone gets two
+        # minutes of the recording and not twelve seconds of it.
+        extend = max(0.0, float(settings.get("extend_to_seconds", 0.0)))
+
         out: list[dict[str, Any]] = []
         for layer, row in enumerate(rows, start=1):
             for (start, length), pick in zip(pieces, row):
                 if pick is None:
                     continue
+                offset = float(pick["offset_seconds"])
+                total = float(pick.get("duration_seconds") or 0.0)
+                if extend > duration and len(pieces) == 1:
+                    length = round(min(extend, total - offset) if total > 0 else extend, 3)
+                before = min(handle, offset)
+                after = min(handle, max(0.0, total - offset - length)) if total > 0 else handle
                 dst = work / f"{generated.stem}_L{layer}_{start:.2f}.wav"
-                await fetch_snippet(client, search_url, int(pick["id"]), float(pick["offset_seconds"]), length, dst,
+                await fetch_snippet(client, search_url, int(pick["id"]), offset - before, length + before + after, dst,
                                     channels=int(settings.get("channels", 2)))
                 out.append({"layer": layer, "start_seconds": round(start, 3), "length_seconds": length,
+                            "handle_before_seconds": round(before, 3), "handle_after_seconds": round(after, 3),
                             "sound_id": int(pick["id"]), "library": pick.get("library"),
                             "external_id": pick.get("external_id"), "description": pick.get("description"),
-                            "category": pick.get("category"), "offset_seconds": float(pick["offset_seconds"]),
+                            "category": pick.get("category"), "offset_seconds": offset,
                             "similarity": float(pick["similarity"]), "path": dst})
     return out

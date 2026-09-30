@@ -474,6 +474,165 @@ async def spot(
             set_progress(job_id, stage="failed")
 
 
+# ── Scenes ───────────────────────────────────────────────────────────────────
+# Which consecutive clips of a range belong to one scene (same place, continuous
+# time), so that sounds can be budgeted and organised per scene rather than per
+# clip. The model sees the last frames of one clip and the first of the next and
+# says whether the picture stays in the scene; every scene then gets a name.
+
+SCENE_SYSTEM_PROMPT = """You are a film editor looking at consecutive shots of a silent picture.
+A scene is one place and one continuous stretch of story time. A new camera angle,
+a close-up or a reverse shot of the same place at the same moment is the SAME scene.
+A different place, or a clear jump in time (day to night, a new day, a different
+event), starts a NEW scene."""
+
+SCENE_PAIR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"same_scene": {"type": "boolean"}, "reason": {"type": "string"}},
+    "required": ["same_scene", "reason"],
+}
+SCENE_NAME_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"name": {"type": "string"}, "description": {"type": "string"}},
+    "required": ["name", "description"],
+}
+
+
+class Scene(BaseModel):
+    index: int = Field(description="1-based")
+    name: str = Field(description="Two to five words: place and, if visible, time of day")
+    description: str
+    first_clip: int = Field(description="0-based index into the sent clips")
+    last_clip: int
+
+
+class ScenesResponse(BaseModel):
+    scenes: list[Scene]
+    clip_scenes: list[int] = Field(description="Scene index per sent clip")
+    model: str
+    seconds_taken: float
+
+
+def extract_frame_at(video: Path, seconds: float, dst: Path) -> Path | None:
+    subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, seconds):.3f}", "-i", str(video),
+                    "-frames:v", "1", "-vf", f"scale={FRAME_WIDTH}:-2", "-q:v", "4", str(dst)], check=False)
+    return dst if dst.exists() else None
+
+
+async def ask_vlm(client: httpx.AsyncClient, frames: list[Path], system: str, text: str,
+                  schema: dict[str, Any], model: str) -> dict:
+    """One structured question about some frames, in either API dialect."""
+    if VLM_API == "ollama":
+        body = {"model": model, "stream": False, "format": schema,
+                "options": {"temperature": VLM_TEMPERATURE, "num_ctx": VLM_NUM_CTX},
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": text, "images": [_b64(p) for p in frames]}]}
+        response = await client.post(f"{VLM_URL}/api/chat", json=body)
+        response.raise_for_status()
+        return json.loads(response.json()["message"]["content"])
+    content: list[dict] = [{"type": "text", "text": text + "\nSchema: " + json.dumps(schema)}]
+    for path in frames:
+        content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + _b64(path)}})
+    body = {"model": model, "temperature": VLM_TEMPERATURE, "response_format": {"type": "json_object"},
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}]}
+    response = await client.post(f"{VLM_URL}/v1/chat/completions", json=body)
+    response.raise_for_status()
+    return json.loads(response.json()["choices"][0]["message"]["content"])
+
+
+@app.post("/scenes", response_model=ScenesResponse)
+async def scenes(
+    videos: list[UploadFile] = File(..., description="the clips of the range, in timeline order"),
+    names: str | None = Form(None, description="JSON list of clip names, same order"),
+    model: str | None = Form(None),
+    job_id: str | None = Form(None),
+):
+    """Group consecutive clips into scenes and name each scene."""
+    t0 = time.time()
+    model = model or VLM_MODEL
+    try:
+        clip_names = [str(n) for n in json.loads(names)] if names else []
+    except ValueError:
+        clip_names = []
+    workdir = Path(tempfile.mkdtemp(prefix="scenes_"))
+    try:
+        # Two frames per clip, from just after its start and just before its end.
+        clips: list[dict] = []
+        for n, upload in enumerate(videos):
+            path = workdir / f"clip_{n}.mp4"
+            with path.open("wb") as handle:
+                shutil.copyfileobj(upload.file, handle)
+            duration = probe_duration(path)
+            head = extract_frame_at(path, min(0.5, duration / 4), workdir / f"c{n}_head.jpg")
+            tail = extract_frame_at(path, max(duration - 0.5, duration * 3 / 4), workdir / f"c{n}_tail.jpg")
+            frames = [f for f in (head, tail) if f is not None]
+            if not frames:
+                raise HTTPException(400, f"no frame could be extracted from clip {n}")
+            clips.append({"index": n, "name": clip_names[n] if n < len(clip_names) else f"clip {n + 1}",
+                          "head": frames[0], "tail": frames[-1]})
+        calls_total = max(0, len(clips) - 1)
+        set_progress(job_id, stage="scenes", fraction=0.0, detail=f"{len(clips)} clips")
+
+        # Pairwise: does clip n continue the scene of clip n-1?
+        breaks: list[bool] = []
+        async with httpx.AsyncClient(timeout=VLM_TIMEOUT_S) as client:
+            for n in range(1, len(clips)):
+                set_progress(job_id, stage="scenes", fraction=(n - 1) / max(1, calls_total + 1),
+                             detail=f"clip {n} of {len(clips) - 1}: same scene as the one before?")
+                prev, cur = clips[n - 1], clips[n]
+                text = ("Frames 1 and 2 are the beginning and the end of shot A, frames 3 and 4 the beginning "
+                        "and the end of the next shot B, which follows A directly in the cut. Does shot B "
+                        "continue the scene of shot A (same place, continuous time)? Return JSON.")
+                try:
+                    answer = await ask_vlm(client, [prev["head"], prev["tail"], cur["head"], cur["tail"]],
+                                           SCENE_SYSTEM_PROMPT, text, SCENE_PAIR_SCHEMA, model)
+                except httpx.HTTPError as exc:
+                    raise HTTPException(502, f"model endpoint {VLM_URL} failed: {exc}")
+                same = bool(answer.get("same_scene"))
+                log.info("scenes: %s -> %s: %s (%s)", prev["name"], cur["name"],
+                         "same" if same else "NEW", str(answer.get("reason", ""))[:120])
+                breaks.append(not same)
+
+            groups: list[list[dict]] = [[clips[0]]] if clips else []
+            for n in range(1, len(clips)):
+                if breaks[n - 1]:
+                    groups.append([clips[n]])
+                else:
+                    groups[-1].append(clips[n])
+
+            # A name per scene, from up to eight of its frames.
+            out: list[Scene] = []
+            for k, group in enumerate(groups, start=1):
+                set_progress(job_id, stage="scenes", fraction=(calls_total + k / max(1, len(groups))) / (calls_total + 1),
+                             detail=f"naming scene {k} of {len(groups)}")
+                frames = [c["head"] for c in group] + [group[-1]["tail"]]
+                if len(frames) > 8:
+                    step = len(frames) / 8.0
+                    frames = [frames[int(i * step)] for i in range(8)]
+                text = (f"These {len(frames)} frames come from one scene of {len(group)} shot(s). Name the scene "
+                        "in two to five words (the place and, if visible, the time of day), then describe in "
+                        "one sentence what happens there. Return JSON.")
+                try:
+                    answer = await ask_vlm(client, frames, SCENE_SYSTEM_PROMPT, text, SCENE_NAME_SCHEMA, model)
+                except httpx.HTTPError as exc:
+                    raise HTTPException(502, f"model endpoint {VLM_URL} failed: {exc}")
+                out.append(Scene(index=k, name=str(answer.get("name") or f"Scene {k}").strip()[:60],
+                                 description=str(answer.get("description") or "").strip(),
+                                 first_clip=group[0]["index"], last_clip=group[-1]["index"]))
+
+        clip_scenes = [next(s.index for s in out if s.first_clip <= c["index"] <= s.last_clip) for c in clips]
+        set_progress(job_id, stage="done", fraction=1.0, detail=f"{len(out)} scenes in {len(clips)} clips")
+        log.info("scenes: %d clips -> %d scene(s): %s", len(clips), len(out), "; ".join(s.name for s in out))
+        return ScenesResponse(scenes=out, clip_scenes=clip_scenes, model=model,
+                              seconds_taken=round(time.time() - t0, 2))
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(400, f"could not read a clip: {exc}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        if job_id and PROGRESS.get(job_id, {}).get("stage") != "done":
+            set_progress(job_id, stage="failed")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host=os.environ.get("API_HOST", "0.0.0.0"),

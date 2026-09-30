@@ -148,11 +148,19 @@ def parse_events(raw: Optional[str], video_length: float) -> list[dict]:
 async def match_sound(generated: Path, work: Path, sound: dict, job_id: Optional[str], n: int, total: int,
                       base: float, pieces_per_10s: int, min_piece_seconds: float, layers: int,
                       text_weight: float, library: Optional[str], category_filter: bool,
-                      min_similarity: float = 0.0) -> dict:
+                      min_similarity: float = 0.0, ambience_handle_seconds: float = 0.0,
+                      event_seconds: float = 0.0) -> dict:
     """Library pieces that sound like `generated`, kept for download next to it.
-    A failure here is reported in the answer and does not lose the generated sound."""
+    An ambience gets `ambience_handle_seconds` of the recording before and after each
+    piece (for fades), and a recording that matched it as a whole is cut in the length
+    of the event (`event_seconds`) when that is longer than the generated sound; other
+    categories are cut to the piece. A failure here is reported in the answer and does
+    not lose the generated sound."""
+    ambience = str(sound.get("category", "")).lower() == "ambience"
+    handle = ambience_handle_seconds if ambience else 0.0
     settings = {"pieces_per_10s": pieces_per_10s, "min_piece_seconds": min_piece_seconds, "layers": layers,
-                "text_weight": text_weight, "library": library, "min_similarity": min_similarity}
+                "text_weight": text_weight, "library": library, "min_similarity": min_similarity,
+                "handle_seconds": handle, "extend_to_seconds": event_seconds if ambience else 0.0}
 
     def progress(call: int, calls: int) -> None:
         set_progress(job_id, stage="matching",
@@ -173,7 +181,7 @@ async def match_sound(generated: Path, work: Path, sound: dict, job_id: Optional
         shutil.move(str(piece.pop("path")), str(OUTPUT_DIR / f"{piece_id}.wav"))
         pieces.append({**piece, "id": piece_id, "audio_url": f"/hybrid/files/{piece_id}.wav"})
     log.info("    %d library piece(s) in %d layer(s) for %s", len(pieces), layers, sound["label"])
-    return {"pieces": pieces, "pieces_per_10s": pieces_per_10s, "layers": layers}
+    return {"pieces": pieces, "pieces_per_10s": pieces_per_10s, "layers": layers, "handle_seconds": handle}
 
 
 # ── endpoints ────────────────────────────────────────────────────────────────
@@ -201,6 +209,14 @@ async def hybrid_progress(job_id: str):
     counts as the first half when the backend has to find the events) and `detail`."""
     entry = PROGRESS.get(job_id)
     if entry is None:
+        # A /hybrid/scenes request runs entirely in the spotting service under the same id.
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                got = await client.get(f"{SPOTTING_URL}/spot/progress/{job_id}")
+            if got.status_code == 200:
+                return got.json()
+        except httpx.HTTPError:
+            pass
         raise HTTPException(status_code=404, detail="unknown job")
     if entry.get("stage") == "spotting":
         # The spotting service got the same job_id; fold its progress into ours.
@@ -243,8 +259,33 @@ async def health():
     if not gen:
         raise HTTPException(status_code=503, detail="generation service not reachable")
     return {"status": "ok", "generation": GENERATION_URL, "spotting": SPOTTING_URL if spot else None,
-            "spotting_available": spot, "min_seconds": GEN_MIN_SECONDS, "max_seconds": GEN_MAX_SECONDS,
+            "spotting_available": spot, "scenes_available": spot,
+            "min_seconds": GEN_MIN_SECONDS, "max_seconds": GEN_MAX_SECONDS,
             "search": SEARCH_URL, "database_match": match}
+
+
+@app.post("/hybrid/scenes")
+async def hybrid_scenes(
+    videos: list[UploadFile] = File(...),
+    names: Optional[str] = Form(None),
+    job_id: Optional[str] = Form(None),
+):
+    """Which consecutive clips form one scene: forwarded to the spotting service's
+    `/scenes` (see spotting/README.md). `videos` are the clips of the range in
+    timeline order, `names` an optional JSON list of their names."""
+    files = []
+    for n, upload in enumerate(videos, start=1):
+        files.append(("videos", (Path(upload.filename or f"clip_{n}.mp4").name, await upload.read(), "video/mp4")))
+    data = {}
+    if names:
+        data["names"] = names
+    if job_id:
+        data["job_id"] = job_id
+    async with httpx.AsyncClient(timeout=SPOTTING_TIMEOUT_S) as client:
+        response = await client.post(f"{SPOTTING_URL}/scenes", files=files, data=data)
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"spotting service: {response.status_code} {response.text[:300]}")
+    return response.json()
 
 
 @app.post("/hybrid")
@@ -265,8 +306,12 @@ async def hybrid(
     library: Optional[str] = Form(None),
     category_filter: bool = Form(False),
     min_similarity: float = Form(0.0),
+    ambience_handle_seconds: float = Form(0.0),
 ):
-    """One sound per event; with `match`, library pieces that sound like each one alongside.`events` (JSON list, optional) are relative to the start of the sent video."""
+    """One sound per event; with `match`, library pieces that sound like each one alongside.
+    `events` (JSON list, optional) are relative to the start of the sent video.
+    `ambience_handle_seconds`: an ambience piece keeps that much of its recording before
+    and after the matched stretch (`handle_before_seconds` per piece), for fades."""
     started = time.time()
     if seed < 0:  # -1: pick a base seed; event n uses seed + n
         seed = random.randint(0, 2**30)
@@ -325,7 +370,8 @@ async def hybrid(
             if match:
                 sounds[-1]["match"] = await match_sound(final, work, sounds[-1], job_id, n, len(found), base,
                                                         pieces_per_10s, min_piece_seconds, layers, text_weight,
-                                                        library, category_filter, min_similarity)
+                                                        library, category_filter, min_similarity,
+                                                        max(0.0, ambience_handle_seconds), wanted)
 
         set_progress(job_id, stage="done", fraction=1.0, detail=f"{len(sounds)} sounds")
         return {"sounds": sounds, "events_source": source, "video_duration_seconds": round(length, 3),
