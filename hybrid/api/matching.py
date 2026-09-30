@@ -255,8 +255,9 @@ async def match_generated(generated: Path, work: Path, *, search_url: str, text:
         chosen = [c if c and float(c["similarity"]) >= min_similarity else None for c in chosen]
         rows = [chosen] + choose_layers(candidates, chosen, layers, min_similarity)
 
-        # Handles: extra seconds of the recording before and after the matched stretch
-        # (an ambience needs them for a fade), as far as the recording reaches.
+        # Handles: extra seconds of the recording before the first piece of a layer and
+        # after its last one (an ambience needs them for a fade), as far as the recording
+        # reaches. Pieces in between butt against each other, so they get none.
         handle = max(0.0, float(settings.get("handle_seconds", 0.0)))
         # An event longer than the generated sound (the generation model has a maximum
         # length): a recording that matched the sound as a whole is cut in the length of
@@ -266,15 +267,17 @@ async def match_generated(generated: Path, work: Path, *, search_url: str, text:
 
         out: list[dict[str, Any]] = []
         for layer, row in enumerate(rows, start=1):
-            for (start, length), pick in zip(pieces, row):
+            picked = [k for k, pick in enumerate(row) if pick is not None]
+            first, last = (picked[0], picked[-1]) if picked else (-1, -1)
+            for k, ((start, length), pick) in enumerate(zip(pieces, row)):
                 if pick is None:
                     continue
                 offset = float(pick["offset_seconds"])
                 total = float(pick.get("duration_seconds") or 0.0)
                 if extend > duration and len(pieces) == 1:
                     length = round(min(extend, total - offset) if total > 0 else extend, 3)
-                before = min(handle, offset)
-                after = min(handle, max(0.0, total - offset - length)) if total > 0 else handle
+                before = min(handle, offset) if k == first else 0.0
+                after = (min(handle, max(0.0, total - offset - length)) if total > 0 else handle) if k == last else 0.0
                 dst = work / f"{generated.stem}_L{layer}_{start:.2f}.wav"
                 await fetch_snippet(client, search_url, int(pick["id"]), offset - before, length + before + after, dst,
                                     channels=int(settings.get("channels", 2)))

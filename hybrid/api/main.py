@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from matching import match_generated
@@ -232,13 +232,25 @@ async def hybrid_progress(job_id: str):
     return entry
 
 
+LAST_GENERATION_OK = 0.0     # when the generation service last answered its health check
+BUSY_GRACE_S = 15 * 60       # a service that answered recently is busy, not gone
+
+
 @app.get("/health")
 async def health():
+    global LAST_GENERATION_OK
     async with httpx.AsyncClient(timeout=5) as client:
         try:
             gen = (await client.get(f"{GENERATION_URL}/health")).status_code == 200
         except Exception:
             gen = False
+        # The generation service answers nothing while it generates (the model holds
+        # its process); that is "busy", not "down", for a while after the last answer.
+        busy = False
+        if gen:
+            LAST_GENERATION_OK = time.time()
+        elif time.time() - LAST_GENERATION_OK < BUSY_GRACE_S:
+            gen, busy = True, True
         try:
             spot = (await client.get(f"{SPOTTING_URL}/health")).status_code == 200
         except Exception:
@@ -258,7 +270,8 @@ async def health():
             pass
     if not gen:
         raise HTTPException(status_code=503, detail="generation service not reachable")
-    return {"status": "ok", "generation": GENERATION_URL, "spotting": SPOTTING_URL if spot else None,
+    return {"status": "ok", "generation": GENERATION_URL, "generation_busy": busy,
+            "spotting": SPOTTING_URL if spot else None,
             "spotting_available": spot, "scenes_available": spot,
             "min_seconds": GEN_MIN_SECONDS, "max_seconds": GEN_MAX_SECONDS,
             "search": SEARCH_URL, "database_match": match}
@@ -290,6 +303,7 @@ async def hybrid_scenes(
 
 @app.post("/hybrid")
 async def hybrid(
+    request: Request,
     video: UploadFile = File(...),
     start_timecode: str = Form("00:00:00:00"),
     fps: float = Form(25.0),
@@ -339,6 +353,12 @@ async def hybrid(
 
         sounds: list[dict[str, Any]] = []
         for n, event in enumerate(found, start=1):
+            if await request.is_disconnected():
+                # The caller is gone (the plugin's Stop kills its script): do not spend
+                # minutes of GPU time on sounds nobody will fetch.
+                log.info("%s: caller disconnected after %d of %d sounds, stopping", src.name, n - 1, len(found))
+                set_progress(job_id, stage="cancelled", fraction=1.0, detail="caller disconnected")
+                raise HTTPException(status_code=499, detail="caller disconnected")
             set_progress(job_id, stage="generating", fraction=base + (1 - base) * (n - 1) / max(1, len(found)),
                          detail=f"sound {n} of {len(found)}: {event.get('label') or 'sound'}")
             start = float(event["start_seconds"])
@@ -356,7 +376,10 @@ async def hybrid(
             text = (event.get("description") or event.get("label") or "").strip()
             full_prompt = ", ".join(p for p in (text, prompt.strip()) if p)
             raw = work / f"event_{n}_raw.wav"
-            await generate(piece, full_prompt, negative_prompt, seed + n, gen_len, raw)
+            # The plugin's negative prompt keeps voices and music out of effects and
+            # atmospheres; for an event that IS speech or music it would fight the prompt.
+            negative = "" if str(event.get("category", "")).lower() in ("dialogue", "music") else negative_prompt
+            await generate(piece, full_prompt, negative, seed + n, gen_len, raw)
 
             sound_id = uuid.uuid4().hex
             final = OUTPUT_DIR / f"{sound_id}.wav"
@@ -379,7 +402,7 @@ async def hybrid(
     finally:
         for f in work.glob("*"):
             f.unlink(missing_ok=True)
-        if job_id and PROGRESS.get(job_id, {}).get("stage") != "done":
+        if job_id and PROGRESS.get(job_id, {}).get("stage") not in ("done", "cancelled"):
             set_progress(job_id, stage="failed")
         work.rmdir()
 
