@@ -19,6 +19,7 @@ on the host, or a remote endpoint (see the top-level README).
 | `GET /capabilities` | Model name, API dialect, sampling settings. |
 | `POST /spot` | Multipart form: `video` (file), `start_timecode` (`HH:MM:SS:FF`, where the sent video starts on the timeline), `fps` (timecode rate), optional `hints` (free text about the scene), optional `sample_fps`, optional `job_id` (any unique string; enables the progress query). |
 | `GET /spot/progress/{job_id}` | While a `/spot` request with that `job_id` runs: `stage`, `fraction` (0..1, model calls done) and `detail` ("frames 16 of 40"). The plugin polls this every two seconds and shows the percentage for the clip. Optional: a backend without it just shows a busy bar. |
+| `POST /scenes` | Multipart form: `videos` (the clips of a range, one file each, in timeline order), optional `names` (JSON list, same order), optional `job_id` (progress under `/spot/progress/{job_id}`). Groups consecutive clips into scenes and names them, see below. Optional: the plugin's *Detect scenes* switch needs it. |
 
 `/spot` answers:
 
@@ -44,6 +45,28 @@ on the host, or a remote endpoint (see the top-level README).
 `category` is one of `dialogue`, `foley`, `sfx`, `ambience`, `music`, and
 dialogue means human speech only. Overlapping chunks of frames are analysed
 separately and their near-duplicate events are folded.
+
+`/scenes` answers:
+
+```json
+{
+  "scenes": [
+    {"index": 1, "name": "Urban street, night", "description": "A taxi crosses a busy junction.",
+     "first_clip": 0, "last_clip": 1},
+    {"index": 2, "name": "Living room, day", "description": "…", "first_clip": 2, "last_clip": 3}
+  ],
+  "clip_scenes": [1, 1, 2, 2],
+  "model": "gemma4:e4b-it-qat",
+  "seconds_taken": 61.0
+}
+```
+
+A scene is one place and one continuous stretch of story time: a new angle of
+the same place at the same moment stays in the scene, a new place or a jump in
+time starts the next. The reference implementation shows the model the first
+and last frame of two consecutive clips and asks whether the second continues
+the scene (one call per cut), then names every scene from up to eight of its
+frames. The plugin writes one memory location per scene, spanning its clips.
 
 ## Choosing the model
 
