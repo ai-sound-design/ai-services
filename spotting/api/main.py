@@ -41,6 +41,10 @@ log = logging.getLogger("spotting")
 VLM_URL = os.environ.get("VLM_URL", "http://ollama:11434").rstrip("/")
 VLM_MODEL = os.environ.get("VLM_MODEL", "gemma4:e4b-it-qat")
 VLM_API = os.environ.get("VLM_API", "ollama")
+# A hosted OpenAI-compatible service (OpenAI itself, a gateway) wants a key; a local
+# LM Studio or vLLM does not. Sent as a bearer token with every request when set.
+VLM_API_KEY = os.environ.get("VLM_API_KEY", "").strip()
+VLM_HEADERS = {"Authorization": f"Bearer {VLM_API_KEY}"} if VLM_API_KEY else {}
 VLM_TIMEOUT_S = float(os.environ.get("VLM_TIMEOUT_S", "600"))
 SAMPLE_FPS = float(os.environ.get("SAMPLE_FPS", "2"))
 FRAME_WIDTH = int(os.environ.get("FRAME_WIDTH", "512"))
@@ -112,22 +116,38 @@ EVENT_SCHEMA: dict[str, Any] = {
                     "start_seconds": {"type": "number"},
                     "end_seconds": {"type": "number"},
                     "confidence": {"type": "number"},
+                    "temporal": {"type": "string", "enum": ["discrete", "continuous", "stationary"]},
                 },
                 "required": ["label", "category", "description",
-                             "start_seconds", "end_seconds", "confidence"],
+                             "start_seconds", "end_seconds", "confidence", "temporal"],
             },
         }
     },
     "required": ["events"],
 }
 
-# The model never hears anything (the audio is stripped before sampling), and
-# the picture may not have a soundtrack yet. Saying so explicitly matters: asked
-# to list "audible" events, gemma4:e4b-it-qat returned nothing for a cat walking
-# past a robot vacuum and for a serval facing a dog; asked to predict what the
-# visible sources would sound like, it named the vacuum motor, the paw steps and
-# the room tone. Spelling out that dialogue is human speech keeps bird calls
-# out of the dialogue category.
+# The kinds of sound an editor can ask for, and the words the model is given for them
+EVENT_CATEGORIES = ("dialogue", "foley", "sfx", "ambience", "music")
+CATEGORY_WORDS = {"dialogue": "dialogue (human speech)",
+                  "foley": "foley (footsteps, clothes, objects handled by people)",
+                  "sfx": "sound effects (machines, vehicles, animals, impacts, weather)",
+                  "ambience": "ambience (the room tone or atmosphere of the place)",
+                  "music": "music with a visible source"}
+
+
+def wanted_categories(categories: str | None) -> list[str]:
+    """The kinds named in a comma-separated `categories`; empty when all or none are named."""
+    named = [c.strip().lower() for c in (categories or "").split(",") if c.strip()]
+    wanted = [c for c in EVENT_CATEGORIES if c in named]
+    return wanted if 0 < len(wanted) < len(EVENT_CATEGORIES) else []
+
+
+def category_hint(wanted: list[str], hints: str | None) -> str | None:
+    """The editor's hint to the model, extended by which kinds of sound are wanted."""
+    if not wanted:
+        return hints
+    text = "Only these kinds of sound are needed: " + "; ".join(CATEGORY_WORDS[c] for c in wanted) + "."
+    return f"{hints.strip()} {text}" if hints and hints.strip() else text
 SYSTEM_PROMPT = """You are a film sound editor doing a spotting pass on a silent picture.
 You see consecutive frames of one shot, each labelled with its time in seconds.
 There is no audio: the soundtrack has yet to be designed. Predict, from what is
@@ -142,7 +162,11 @@ in seconds during which it would be heard, judged from the frames in which its
 source is active. Be concrete: "dog barks twice", not "animal sounds". Only list
 sounds a visible source would make; do not invent off-screen sounds. If a sound
 plausibly continues between two frames, span it. Use the label as a marker name:
-short, specific, no punctuation."""
+short, specific, no punctuation. Say for each event how it behaves in time:
+"discrete" for separate repeated events (footsteps, barks, knocks, clicks),
+"continuous" for a sound that runs on with changes (an engine, rain on a roof,
+a hum that swells), "stationary" for a steady bed that hardly changes (room
+tone, wind, distant traffic)."""
 
 
 # ── Video handling ───────────────────────────────────────────────────────────
@@ -349,7 +373,7 @@ def _fold_near_duplicates(events: list[dict]) -> list[dict]:
 async def health():
     """Reachability of the model endpoint, and whether the model is present."""
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, headers=VLM_HEADERS) as client:
             if VLM_API == "ollama":
                 tags = (await client.get(f"{VLM_URL}/api/tags")).json()
                 names = {m["name"] for m in tags.get("models", [])}
@@ -370,7 +394,8 @@ async def capabilities():
     return {
         "service": "spotting",
         "input": {"video": "multipart file", "start_timecode": "HH:MM:SS:FF",
-                  "fps": "timecode frame rate", "hints": "optional free text"},
+                  "fps": "timecode frame rate", "hints": "optional free text",
+                  "categories": "optional, comma-separated kinds to keep (dialogue, foley, sfx, ambience, music)"},
         "output": "events[] with start/end seconds and timecodes",
         "categories": list(CATEGORIES),
         "model": VLM_MODEL,
@@ -398,8 +423,13 @@ async def spot(
     sample_fps: float | None = Form(None),
     model: str | None = Form(None),
     job_id: str | None = Form(None),
+    categories: str | None = Form(None),
 ):
+    """`categories` (optional, comma-separated: dialogue, foley, sfx, ambience, music):
+    the model is told which kinds are wanted and other events are dropped."""
     t0 = time.time()
+    wanted = wanted_categories(categories)
+    hints = category_hint(wanted, hints)
     model = model or VLM_MODEL
     sample_fps = sample_fps or SAMPLE_FPS
     caller = CALLERS.get(VLM_API)
@@ -432,7 +462,7 @@ async def spot(
                      frames_total=len(frames), calls_total=len(starts), calls_done=0)
 
         raw_events: list[dict] = []
-        async with httpx.AsyncClient(timeout=VLM_TIMEOUT_S) as client:
+        async with httpx.AsyncClient(timeout=VLM_TIMEOUT_S, headers=VLM_HEADERS) as client:
             for k, i in enumerate(starts, start=1):
                 chunk = frames[i:i + size]
                 # What is being analysed now; the fraction counts model calls, each of which
@@ -457,6 +487,8 @@ async def spot(
 
         set_progress(job_id, stage="done", fraction=1.0, detail=f"{len(starts)} steps, {len(frames)} frames")
         events = merge_events(raw_events, duration)
+        if wanted:
+            events = [e for e in events if str(e.get("category", "")).lower() in wanted]
         for event in events:
             # A sound seen in one frame is audible at least until the next sample.
             if event["end_seconds"] - event["start_seconds"] < 1 / sample_fps:
@@ -477,8 +509,11 @@ async def spot(
 # ── Scenes ───────────────────────────────────────────────────────────────────
 # Which consecutive clips of a range belong to one scene (same place, continuous
 # time), so that sounds can be budgeted and organised per scene rather than per
-# clip. The model sees the last frames of one clip and the first of the next and
-# says whether the picture stays in the scene; every scene then gets a name.
+# clip. A small model mixes up four pictures at once, so the question goes in two easy
+# steps: every clip is described alone from its first and last frame (place, indoors
+# or outdoors, time of day), then two neighbours are compared by those descriptions
+# only. Indoors next to outdoors is a new scene without asking. Scene names come from
+# the descriptions too.
 
 SCENE_SYSTEM_PROMPT = """You are a film editor looking at consecutive shots of a silent picture.
 A scene is one place and one continuous stretch of story time. A new camera angle,
@@ -486,6 +521,16 @@ a close-up or a reverse shot of the same place at the same moment is the SAME sc
 A different place, or a clear jump in time (day to night, a new day, a different
 event), starts a NEW scene."""
 
+SCENE_CLIP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "place": {"type": "string"},
+        "setting": {"type": "string", "enum": ["indoors", "outdoors", "unclear"]},
+        "time_of_day": {"type": "string", "enum": ["day", "night", "unclear"]},
+        "what_is_seen": {"type": "string"},
+    },
+    "required": ["place", "setting", "time_of_day", "what_is_seen"],
+}
 SCENE_PAIR_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {"same_scene": {"type": "boolean"}, "reason": {"type": "string"}},
@@ -570,27 +615,54 @@ async def scenes(
                 raise HTTPException(400, f"no frame could be extracted from clip {n}")
             clips.append({"index": n, "name": clip_names[n] if n < len(clip_names) else f"clip {n + 1}",
                           "head": frames[0], "tail": frames[-1]})
-        calls_total = max(0, len(clips) - 1)
         set_progress(job_id, stage="scenes", fraction=0.0, detail=f"{len(clips)} clips")
 
-        # Pairwise: does clip n continue the scene of clip n-1?
+        # Step 1: every clip on its own, then step 2: neighbours compared by text.
+        calls_total = len(clips) + max(0, len(clips) - 1)
         breaks: list[bool] = []
-        async with httpx.AsyncClient(timeout=VLM_TIMEOUT_S) as client:
-            for n in range(1, len(clips)):
-                set_progress(job_id, stage="scenes", fraction=(n - 1) / max(1, calls_total + 1),
-                             detail=f"clip {n} of {len(clips) - 1}: same scene as the one before?")
-                prev, cur = clips[n - 1], clips[n]
-                text = ("Frames 1 and 2 are the beginning and the end of shot A, frames 3 and 4 the beginning "
-                        "and the end of the next shot B, which follows A directly in the cut. Does shot B "
-                        "continue the scene of shot A (same place, continuous time)? Return JSON.")
+        async with httpx.AsyncClient(timeout=VLM_TIMEOUT_S, headers=VLM_HEADERS) as client:
+            for n, clip in enumerate(clips):
+                set_progress(job_id, stage="scenes", fraction=n / max(1, calls_total + 1),
+                             detail=f"clip {n + 1} of {len(clips)}: where does it take place?")
+                text = ("Frames 1 and 2 are the beginning and the end of one shot. Where does it take place? "
+                        "Give the place in a few words (for example 'living room', 'city street', 'forest'), "
+                        "whether it is indoors or outdoors, the time of day, and in one sentence what is seen. "
+                        "Return JSON.")
                 try:
-                    answer = await ask_vlm(client, [prev["head"], prev["tail"], cur["head"], cur["tail"]],
-                                           SCENE_SYSTEM_PROMPT, text, SCENE_PAIR_SCHEMA, model)
+                    answer = await ask_vlm(client, [clip["head"], clip["tail"]], SCENE_SYSTEM_PROMPT, text,
+                                           SCENE_CLIP_SCHEMA, model)
                 except httpx.HTTPError as exc:
                     raise HTTPException(502, f"model endpoint {VLM_URL} failed: {exc}")
-                same = bool(answer.get("same_scene"))
+                clip["place"] = str(answer.get("place") or "").strip()[:80]
+                clip["setting"] = str(answer.get("setting") or "unclear").lower()
+                clip["time"] = str(answer.get("time_of_day") or "unclear").lower()
+                clip["seen"] = str(answer.get("what_is_seen") or "").strip()[:200]
+                log.info("scenes: %s: %s, %s, %s (%s)", clip["name"], clip["place"], clip["setting"],
+                         clip["time"], clip["seen"][:100])
+
+            def described(c: dict) -> str:
+                return f"{c['place']} ({c['setting']}, {c['time']}): {c['seen']}"
+
+            for n in range(1, len(clips)):
+                set_progress(job_id, stage="scenes", fraction=(len(clips) + n - 1) / max(1, calls_total + 1),
+                             detail=f"cut {n} of {len(clips) - 1}: clips {n} and {n + 1} the same scene?")
+                prev, cur = clips[n - 1], clips[n]
+                known = {"indoors", "outdoors"}
+                if prev["setting"] in known and cur["setting"] in known and prev["setting"] != cur["setting"]:
+                    same, reason = False, f"{prev['setting']} then {cur['setting']}"
+                elif prev["time"] in ("day", "night") and cur["time"] in ("day", "night") and prev["time"] != cur["time"]:
+                    same, reason = False, f"{prev['time']} then {cur['time']}"
+                else:
+                    text = (f"Shot A: {described(prev)}\nShot B, which follows A directly in the cut: "
+                            f"{described(cur)}\nIs B the same place as A at the same moment (the same scene), "
+                            "or a different place? Only the place matters, not what happens there. Return JSON.")
+                    try:
+                        answer = await ask_vlm(client, [], SCENE_SYSTEM_PROMPT, text, SCENE_PAIR_SCHEMA, model)
+                    except httpx.HTTPError as exc:
+                        raise HTTPException(502, f"model endpoint {VLM_URL} failed: {exc}")
+                    same, reason = bool(answer.get("same_scene")), str(answer.get("reason", ""))
                 log.info("scenes: %s -> %s: %s (%s)", prev["name"], cur["name"],
-                         "same" if same else "NEW", str(answer.get("reason", ""))[:120])
+                         "same" if same else "NEW", reason[:120])
                 breaks.append(not same)
 
             groups: list[list[dict]] = [[clips[0]]] if clips else []
@@ -600,24 +672,27 @@ async def scenes(
                 else:
                     groups[-1].append(clips[n])
 
-            # A name per scene, from up to eight of its frames.
+            # A name per scene from its clips' descriptions; one clip names itself.
             out: list[Scene] = []
             for k, group in enumerate(groups, start=1):
                 set_progress(job_id, stage="scenes", fraction=(calls_total + k / max(1, len(groups))) / (calls_total + 1),
                              detail=f"naming scene {k} of {len(groups)}")
-                frames = [c["head"] for c in group] + [group[-1]["tail"]]
-                if len(frames) > 8:
-                    step = len(frames) / 8.0
-                    frames = [frames[int(i * step)] for i in range(8)]
-                text = (f"These {len(frames)} frames come from one scene of {len(group)} shot(s). Name the scene "
-                        "in two to five words (the place and, if visible, the time of day), then describe in "
-                        "one sentence what happens there. Return JSON.")
-                try:
-                    answer = await ask_vlm(client, frames, SCENE_SYSTEM_PROMPT, text, SCENE_NAME_SCHEMA, model)
-                except httpx.HTTPError as exc:
-                    raise HTTPException(502, f"model endpoint {VLM_URL} failed: {exc}")
-                out.append(Scene(index=k, name=str(answer.get("name") or f"Scene {k}").strip()[:60],
-                                 description=str(answer.get("description") or "").strip(),
+                first = group[0]
+                name = first["place"].capitalize() if first["place"] else f"Scene {k}"
+                if first["time"] in ("day", "night"):
+                    name += ", " + ("daytime" if first["time"] == "day" else "night")
+                description = first["seen"]
+                if len(group) > 1:
+                    text = ("These shots form one scene:\n" + "\n".join(f"- {described(c)}" for c in group)
+                            + "\nName the scene in two to five words (the place and, if known, the time of "
+                              "day), then describe in one sentence what happens there. Return JSON.")
+                    try:
+                        answer = await ask_vlm(client, [], SCENE_SYSTEM_PROMPT, text, SCENE_NAME_SCHEMA, model)
+                        name = str(answer.get("name") or name).strip()
+                        description = str(answer.get("description") or description).strip()
+                    except httpx.HTTPError as exc:
+                        raise HTTPException(502, f"model endpoint {VLM_URL} failed: {exc}")
+                out.append(Scene(index=k, name=name[:60] or f"Scene {k}", description=description,
                                  first_clip=group[0]["index"], last_clip=group[-1]["index"]))
 
         clip_scenes = [next(s.index for s in out if s.first_clip <= c["index"] <= s.last_clip) for c in clips]

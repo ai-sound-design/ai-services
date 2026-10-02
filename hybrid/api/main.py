@@ -17,11 +17,12 @@ A future model that does all of this in one pass replaces this service without
 a change to the plugin: it only has to fulfil the same contract (see README).
 
 Environment:
-    GENERATION_URL   http://mmaudio-api:8000     video (or prompt) -> audio
+    GENERATION_URL   http://generation-gateway:8010  video (or prompt) -> audio, any length
+                     (the gateway in front of the model; its health says min_seconds/max_seconds)
     SPOTTING_URL     http://spotting-api:8003    video -> events, used when no events are sent
     SEARCH_URL       http://sound-search-api:8002 sound -> library windows, used with `match`
-    GEN_MIN_SECONDS  4     the generation model's shortest length: shorter events are padded, then trimmed
-    GEN_MAX_SECONDS  12    its longest length: longer events get a sound of this length
+    GEN_MIN_SECONDS  4     fallback length window while the generation service's health
+    GEN_MAX_SECONDS  600   does not say; an event longer than the maximum gets that much
     OUTPUT_DIR       /data/hybrid                where the sounds are kept for download
     KEEP_HOURS       24                          how long
 """
@@ -34,6 +35,7 @@ import random
 import shutil
 import subprocess
 import tempfile
+import math
 import time
 import uuid
 from pathlib import Path
@@ -49,11 +51,30 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "info").upper(),
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("hybrid")
 
-GENERATION_URL = os.environ.get("GENERATION_URL", "http://mmaudio-api:8000").rstrip("/")
+GENERATION_URL = os.environ.get("GENERATION_URL", "http://generation-gateway:8010").rstrip("/")
 SPOTTING_URL = os.environ.get("SPOTTING_URL", "http://spotting-api:8003").rstrip("/")
 SEARCH_URL = os.environ.get("SEARCH_URL", "http://sound-search-api:8002").rstrip("/")
 GEN_MIN_SECONDS = float(os.environ.get("GEN_MIN_SECONDS", "4"))
-GEN_MAX_SECONDS = float(os.environ.get("GEN_MAX_SECONDS", "12"))
+GEN_MAX_SECONDS = float(os.environ.get("GEN_MAX_SECONDS", "600"))
+GEN_LIMITS: dict = {"min": GEN_MIN_SECONDS, "max": GEN_MAX_SECONDS, "window": GEN_MAX_SECONDS, "at": 0.0}
+
+
+async def generation_limits(client: httpx.AsyncClient) -> dict:
+    """The generation service's length window from its health (min_seconds, max_seconds,
+    window_seconds), remembered for a minute; the environment's values when it does not say."""
+    if time.time() - GEN_LIMITS["at"] < 60.0:
+        return GEN_LIMITS
+    try:
+        answer = await client.get(f"{GENERATION_URL}/health", timeout=8.0)
+        if answer.status_code == 200:
+            info = answer.json()
+            GEN_LIMITS["min"] = float(info.get("min_seconds", GEN_MIN_SECONDS))
+            GEN_LIMITS["max"] = float(info.get("max_seconds", GEN_MAX_SECONDS))
+            GEN_LIMITS["window"] = float(info.get("window_seconds", GEN_LIMITS["max"]))
+            GEN_LIMITS["at"] = time.time()
+    except (httpx.HTTPError, ValueError, TypeError):
+        pass
+    return GEN_LIMITS
 CUT_MARGIN = 0.25   # seconds of extra video per piece, see the generation loop
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/data/hybrid"))
 KEEP_HOURS = float(os.environ.get("KEEP_HOURS", "24"))
@@ -97,10 +118,12 @@ def housekeeping() -> None:
 
 
 async def spot_events(video: Path, start_timecode: str, fps: float,
-                      job_id: Optional[str] = None) -> tuple[list[dict], Optional[str]]:
+                      job_id: Optional[str] = None, categories: Optional[str] = None) -> tuple[list[dict], Optional[str]]:
     data = {"start_timecode": start_timecode, "fps": str(fps)}
     if job_id:
         data["job_id"] = job_id
+    if categories:
+        data["categories"] = categories          # which kinds of sound the editor wants spotted
     async with httpx.AsyncClient(timeout=SPOTTING_TIMEOUT_S) as client:
         with video.open("rb") as handle:
             response = await client.post(f"{SPOTTING_URL}/spot", files={"video": (video.name, handle, "video/mp4")},
@@ -111,9 +134,39 @@ async def spot_events(video: Path, start_timecode: str, fps: float,
     return body.get("events", []), body.get("model")
 
 
-async def generate(video: Path, prompt: str, negative_prompt: str, seed: int, duration: float, dst: Path) -> None:
+# What an effect, a foley or an atmosphere should not contain; an event that IS speech
+# or music must not get this, it would fight the prompt
+VOICES_AND_MUSIC = "voices, music, melody, singing, speech, interference"
+
+
+def negative_for(event: dict, events: list[dict], user_negative: str) -> str:
+    """The negative prompt of one event: the labels of the other events overlapping it in
+    time (each sound is meant to be one thing, the others have their own sounds), the
+    voices/music list unless the event is dialogue or music, and what the user typed."""
+    start, end = float(event.get("start_seconds", 0.0)), float(event.get("end_seconds", 0.0))
+    own = (str(event.get("label") or "")).strip().lower()
+    parts: list[str] = []
+    for other in events:
+        if other is event:
+            continue
+        label = (str(other.get("label") or "")).strip()
+        if not label or label.lower() == own or label.lower() in (x.lower() for x in parts):
+            continue
+        if float(other.get("start_seconds", 0.0)) < end and start < float(other.get("end_seconds", 0.0)):
+            parts.append(label)
+    if str(event.get("category", "")).lower() not in ("dialogue", "music"):
+        parts.append(VOICES_AND_MUSIC)
+    if user_negative.strip():
+        parts.append(user_negative.strip())
+    return ", ".join(parts)
+
+
+async def generate(video: Path, prompt: str, negative_prompt: str, seed: int, duration: float, dst: Path,
+                   job_id: Optional[str] = None) -> None:
     data = {"prompt": prompt, "negative_prompt": negative_prompt, "seed": str(seed),
             "duration": f"{duration:.2f}", "output_format": "wav"}
+    if job_id:
+        data["job_id"] = job_id        # the gateway reports its windows under the same id
     async with httpx.AsyncClient(timeout=GENERATION_TIMEOUT_S) as client:
         with video.open("rb") as handle:
             response = await client.post(f"{GENERATION_URL}/generate",
@@ -141,7 +194,8 @@ def parse_events(raw: Optional[str], video_length: float) -> list[dict]:
         if start >= video_length:
             continue
         events.append({"label": str(item.get("label") or "sound"), "description": str(item.get("description") or ""),
-                       "category": str(item.get("category") or "sfx"), "start_seconds": start, "end_seconds": end})
+                       "category": str(item.get("category") or "sfx"), "start_seconds": start, "end_seconds": end,
+                       "temporal": str(item.get("temporal") or "")})
     return events
 
 
@@ -149,7 +203,7 @@ async def match_sound(generated: Path, work: Path, sound: dict, job_id: Optional
                       base: float, pieces_per_10s: int, min_piece_seconds: float, layers: int,
                       text_weight: float, library: Optional[str], category_filter: bool,
                       min_similarity: float = 0.0, ambience_handle_seconds: float = 0.0,
-                      event_seconds: float = 0.0) -> dict:
+                      event_seconds: float = 0.0, split_gain: float = 0.03, temporal: str = "") -> dict:
     """Library pieces that sound like `generated`, kept for download next to it.
     An ambience gets `ambience_handle_seconds` of the recording before and after each
     piece (for fades), and a recording that matched it as a whole is cut in the length
@@ -160,7 +214,8 @@ async def match_sound(generated: Path, work: Path, sound: dict, job_id: Optional
     handle = ambience_handle_seconds if ambience else 0.0
     settings = {"pieces_per_10s": pieces_per_10s, "min_piece_seconds": min_piece_seconds, "layers": layers,
                 "text_weight": text_weight, "library": library, "min_similarity": min_similarity,
-                "handle_seconds": handle, "extend_to_seconds": event_seconds if ambience else 0.0}
+                "handle_seconds": handle, "extend_to_seconds": event_seconds if ambience else 0.0,
+                "split_gain": split_gain, "temporal": "stationary" if ambience and not temporal else temporal}
 
     def progress(call: int, calls: int) -> None:
         set_progress(job_id, stage="matching",
@@ -218,6 +273,20 @@ async def hybrid_progress(job_id: str):
         except httpx.HTTPError:
             pass
         raise HTTPException(status_code=404, detail="unknown job")
+    if entry.get("stage") == "generating":
+        # The generation gateway got the same job_id; a long event is made in windows,
+        # and its part count belongs into the detail.
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                got = await client.get(f"{GENERATION_URL}/generate/progress/{job_id}")
+            if got.status_code == 200:
+                gen = got.json()
+                parts = int(gen.get("parts") or 0)
+                if gen.get("stage") == "generating" and parts > 1:
+                    return {**entry, "detail": f"{entry.get('detail', '')} (part {int(gen.get('part') or 0)} of {parts})"}
+        except (httpx.HTTPError, ValueError, TypeError):
+            pass
+        return entry
     if entry.get("stage") == "spotting":
         # The spotting service got the same job_id; fold its progress into ours.
         try:
@@ -268,12 +337,13 @@ async def health():
                 match["reason"] = f"search service answered {answer.status_code}"
         except Exception:
             pass
+        limits = await generation_limits(client)
     if not gen:
         raise HTTPException(status_code=503, detail="generation service not reachable")
     return {"status": "ok", "generation": GENERATION_URL, "generation_busy": busy,
             "spotting": SPOTTING_URL if spot else None,
             "spotting_available": spot, "scenes_available": spot,
-            "min_seconds": GEN_MIN_SECONDS, "max_seconds": GEN_MAX_SECONDS,
+            "min_seconds": limits["min"], "max_seconds": limits["max"], "window_seconds": limits["window"],
             "search": SEARCH_URL, "database_match": match}
 
 
@@ -321,11 +391,21 @@ async def hybrid(
     category_filter: bool = Form(False),
     min_similarity: float = Form(0.0),
     ambience_handle_seconds: float = Form(0.0),
+    split_gain: float = Form(0.03),
+    categories: Optional[str] = Form(None),
 ):
     """One sound per event; with `match`, library pieces that sound like each one alongside.
-    `events` (JSON list, optional) are relative to the start of the sent video.
+    `events` (JSON list, optional) are relative to the start of the sent video; without
+    them the spotting service finds them, kept to the kinds in `categories` (comma-separated:
+    dialogue, foley, sfx, ambience, music) when given.
+    The negative prompt of each sound is built here: the labels of the other events that
+    overlap it in time (so the water does not get the birds), the fixed list against
+    voices and music for everything but dialogue and music, and `negative_prompt` on top.
     `ambience_handle_seconds`: an ambience piece keeps that much of its recording before
-    and after the matched stretch (`handle_before_seconds` per piece), for fades."""
+    and after the matched stretch (`handle_before_seconds` per piece), for fades.
+    `split_gain`: how much the length-weighted similarity must improve for a generated
+    sound to be cut into two pieces searched separately; 0 cuts up to `pieces_per_10s`
+    whenever it does not get worse, so steps or barks get a piece each."""
     started = time.time()
     if seed < 0:  # -1: pick a base seed; event n uses seed + n
         seed = random.randint(0, 2**30)
@@ -345,7 +425,7 @@ async def hybrid(
             found, source = given, "memory_locations"
         else:
             set_progress(job_id, stage="spotting", fraction=0.0, detail="spotting")
-            found, model = await spot_events(src, start_timecode, fps, job_id)
+            found, model = await spot_events(src, start_timecode, fps, job_id, categories)
             source = "spotting"
         base = 0.5 if source == "spotting" else 0.0   # spotting took the first half of the bar
         found = [e for e in found if float(e.get("end_seconds", 0)) > float(e.get("start_seconds", 0))]
@@ -364,11 +444,20 @@ async def hybrid(
             start = float(event["start_seconds"])
             end = min(float(event["end_seconds"]), length)
             wanted = end - start
-            # The generation model has a length window; pad short events (then trim), cap long ones.
-            # The piece is cut a little longer than asked: ffmpeg rounds to whole frames and a
-            # 3.97 s piece would fall under a 4 s minimum.
-            gen_len = min(GEN_MAX_SECONDS, max(GEN_MIN_SECONDS, wanted))
-            cut_start = min(start, max(0.0, length - gen_len - CUT_MARGIN))
+            # The generation service (the gateway) makes any length up to its maximum: a long
+            # event in windows, a short one padded and trimmed. Only its maximum caps an event.
+            async with httpx.AsyncClient() as limits_client:
+                limits = await generation_limits(limits_client)
+            gen_len = min(float(limits["max"]), wanted)
+            if gen_len < wanted:
+                log.warning("%s: event %d is %.0fs, the generation service makes at most %.0fs",
+                            src.name, n, wanted, limits["max"])
+            windows = max(1, int(math.ceil((gen_len - 0.01) / max(1.0, float(limits["window"])))))
+            if windows > 1:
+                set_progress(job_id, detail=f"sound {n} of {len(found)}: {event.get('label') or 'sound'} "
+                                            f"({gen_len:.0f} s, about {windows} parts)")
+            # The piece is cut a little longer than asked: ffmpeg rounds to whole frames.
+            cut_start = min(start, max(0.0, length - CUT_MARGIN))
             cut_len = min(gen_len + CUT_MARGIN, length - cut_start)
             piece = work / f"event_{n}.mp4"
             cut_video(src, cut_start, cut_len, piece)
@@ -376,16 +465,16 @@ async def hybrid(
             text = (event.get("description") or event.get("label") or "").strip()
             full_prompt = ", ".join(p for p in (text, prompt.strip()) if p)
             raw = work / f"event_{n}_raw.wav"
-            # The plugin's negative prompt keeps voices and music out of effects and
-            # atmospheres; for an event that IS speech or music it would fight the prompt.
-            negative = "" if str(event.get("category", "")).lower() in ("dialogue", "music") else negative_prompt
-            await generate(piece, full_prompt, negative, seed + n, gen_len, raw)
+            negative = negative_for(event, found, negative_prompt)
+            log.info("  %d/%d negative: %s", n, len(found), negative or "-")
+            await generate(piece, full_prompt, negative, seed + n, gen_len, raw, job_id=job_id)
 
             sound_id = uuid.uuid4().hex
             final = OUTPUT_DIR / f"{sound_id}.wav"
             trim_audio(raw, min(wanted, gen_len), final)
             sounds.append({"id": sound_id, "label": event.get("label") or f"sound {n}",
                            "category": event.get("category", "sfx"), "description": text,
+                           "temporal": str(event.get("temporal") or ""),
                            "start_seconds": round(start, 3), "end_seconds": round(start + min(wanted, gen_len), 3),
                            "audio_url": f"/hybrid/files/{sound_id}.wav"})
             log.info("  %d/%d %s: %.1fs from %.1fs", n, len(found), sounds[-1]["label"], wanted, start)
@@ -394,7 +483,8 @@ async def hybrid(
                 sounds[-1]["match"] = await match_sound(final, work, sounds[-1], job_id, n, len(found), base,
                                                         pieces_per_10s, min_piece_seconds, layers, text_weight,
                                                         library, category_filter, min_similarity,
-                                                        max(0.0, ambience_handle_seconds), wanted)
+                                                        max(0.0, ambience_handle_seconds), wanted, split_gain,
+                                                        str(sounds[-1].get("temporal") or ""))
 
         set_progress(job_id, stage="done", fraction=1.0, detail=f"{len(sounds)} sounds")
         return {"sounds": sounds, "events_source": source, "video_duration_seconds": round(length, 3),

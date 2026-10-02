@@ -103,8 +103,9 @@ class DatabaseClient:
 
     def window_search(self, query_embedding: np.ndarray, limit: int = 40,
                       libraries: Optional[list[str]] = None, category: Optional[str] = None,
-                      exclude: Optional[list[int]] = None) -> list[dict[str, Any]]:
-        """Nearest 10 s audio windows (CLAP) with their sound's metadata."""
+                      exclude: Optional[list[int]] = None, only: Optional[list[int]] = None) -> list[dict[str, Any]]:
+        """Nearest 10 s audio windows (CLAP) with their sound's metadata. `only`: look
+        inside these sounds alone (a sketch search names its candidates by description first)."""
         embedding = query_embedding.tolist()
         conditions, params = ["TRUE"], []
         if libraries:
@@ -116,6 +117,9 @@ class DatabaseClient:
         if exclude:
             conditions.append("NOT (s.id = ANY(%s))")
             params.append(exclude)
+        if only:
+            conditions.append("s.id = ANY(%s)")
+            params.append(only)
         try:
             with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(

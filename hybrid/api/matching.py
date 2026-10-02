@@ -75,6 +75,43 @@ def boundary_candidates(samples: np.ndarray, min_piece: float) -> list[float]:
     return chosen
 
 
+def auto_piece_bound(samples: np.ndarray, min_piece: float, temporal: str = "") -> int:
+    """How many pieces a generated sound may be cut into when nobody said: one per
+    distinct onset. A run of barks or steps has clear, separate onsets (one piece each,
+    placed where it happens); an engine or a lightsaber hum has few; an ambience is
+    stationary and stays whole. `temporal` is the spotting model's word for the event
+    (discrete, continuous, stationary) and settles the doubtful cases: a stationary
+    event is never cut, a continuous one at most twice per ten seconds."""
+    duration = len(samples) / SAMPLE_RATE
+    most = max(1, int(duration // min_piece)) if min_piece > 0 else 20
+    kind = (temporal or "").lower()
+    if kind == "stationary" or duration < 2 * min_piece:
+        return 1
+    flux, rate = spectral_flux(samples)
+    if len(flux) < 3:
+        return 1
+    # Onsets: peaks that stand well above the typical novelty, at least min_piece apart
+    threshold = float(np.mean(flux) + 1.5 * np.std(flux))
+    peaks = [i for i in range(1, len(flux) - 1) if flux[i] > threshold and flux[i] >= flux[i - 1] and flux[i] >= flux[i + 1]]
+    onsets: list[float] = []
+    for i in peaks:
+        t = i / rate
+        if all(abs(t - o) >= min_piece for o in onsets):
+            onsets.append(t)
+    # Stationary by the signal: the novelty hardly varies (ambiences, steady hums)
+    spread = float(np.std(flux) / (np.mean(flux) + 1e-9))
+    if spread < 0.6 and kind != "discrete":
+        return 1
+    inner = [t for t in onsets if min_piece <= t <= duration - min_piece]
+    bound = len(inner) + 1
+    if kind == "continuous":
+        bound = min(bound, max(1, int(duration / 10.0 * 2 + 0.5)))
+    bound = max(1, min(bound, most))
+    log.info("auto pieces: %.1fs, %d onset(s), spread %.2f, %s -> at most %d piece(s)",
+             duration, len(inner), spread, kind or "no class", bound)
+    return bound
+
+
 def cut_points(samples: np.ndarray, pieces_per_10s: int, min_piece: float) -> list[float]:
     """Piece boundaries in seconds (excluding 0 and the end)."""
     duration = len(samples) / SAMPLE_RATE
@@ -192,7 +229,11 @@ async def match_generated(generated: Path, work: Path, *, search_url: str, text:
     samples = decode(generated)
     duration = len(samples) / SAMPLE_RATE
     min_piece = float(settings.get("min_piece_seconds", 2.0))
-    max_pieces = max(1, int(duration / 10.0 * int(settings.get("pieces_per_10s", 3)) + 0.5))
+    per_10s = int(settings.get("pieces_per_10s", 3))
+    if per_10s <= 0:                                    # automatic: by the sound's onsets and the event's class
+        max_pieces = auto_piece_bound(samples, min_piece, str(settings.get("temporal", "")))
+    else:
+        max_pieces = max(1, int(duration / 10.0 * per_10s + 0.5))
     split_gain = float(settings.get("split_gain", 0.03))
     min_similarity = float(settings.get("min_similarity", 0.0))
     layers = max(1, int(settings.get("layers", 1)))

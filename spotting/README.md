@@ -17,7 +17,7 @@ on the host, or a remote endpoint (see the top-level README).
 |----------|---------|
 | `GET /health` | 2xx when the service and its model are reachable. |
 | `GET /capabilities` | Model name, API dialect, sampling settings. |
-| `POST /spot` | Multipart form: `video` (file), `start_timecode` (`HH:MM:SS:FF`, where the sent video starts on the timeline), `fps` (timecode rate), optional `hints` (free text about the scene), optional `sample_fps`, optional `job_id` (any unique string; enables the progress query). |
+| `POST /spot` | Multipart form: `video` (file), `start_timecode` (`HH:MM:SS:FF`, where the sent video starts on the timeline), `fps` (timecode rate), optional `hints` (free text about the scene), optional `categories` (comma-separated kinds to keep: dialogue, foley, sfx, ambience, music; the model is told which are wanted, other events are dropped), optional `sample_fps`, optional `job_id` (any unique string; enables the progress query). |
 | `GET /spot/progress/{job_id}` | While a `/spot` request with that `job_id` runs: `stage`, `fraction` (0..1, model calls done) and `detail` ("frames 16 of 40"). The plugin polls this every two seconds and shows the percentage for the clip. Optional: a backend without it just shows a busy bar. |
 | `POST /scenes` | Multipart form: `videos` (the clips of a range, one file each, in timeline order), optional `names` (JSON list, same order), optional `job_id` (progress under `/spot/progress/{job_id}`). Groups consecutive clips into scenes and names them, see below. Optional: the plugin's *Detect scenes* switch needs it. |
 
@@ -73,7 +73,8 @@ frames. The plugin writes one memory location per scene, spanning its clips.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `VLM_URL` | `http://ollama:11434` | Where the model runs |
-| `VLM_API` | `ollama` | `ollama` (`/api/chat`) or `openai` (`/v1/chat/completions`, e.g. LM Studio, vLLM) |
+| `VLM_API` | `ollama` | `ollama` (`/api/chat`) or `openai` (`/v1/chat/completions`, e.g. LM Studio, vLLM, or OpenAI itself) |
+| `VLM_API_KEY` | empty | Bearer token for a hosted OpenAI-compatible service (OpenAI: `VLM_URL=https://api.openai.com`); a local server needs none |
 | `VLM_MODEL` | `gemma4:e4b-it-qat` | Must carry a vision projector; a text-only variant silently ignores the frames |
 | `SPOTTING_SAMPLE_FPS` | `2` | Frames sampled per second of video |
 | `SPOTTING_FRAMES_PER_CALL` | `8` | Frames shown to the model per call |
