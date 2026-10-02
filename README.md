@@ -54,7 +54,8 @@ The four kinds of service, one folder each:
 
 | Folder | Service | Port | What it does |
 |--------|---------|------|--------------|
-| [`generation/`](generation/README.md) | `mmaudio-api` | 8000 | Video (or prompt) in, audio out. [MMAudio](https://github.com/hkchengrex/MMAudio) as the reference model; `template/` for wrapping another one. |
+| [`generation/`](generation/README.md) | `mmaudio-api` | 8000 | Video (or prompt) in, one window of audio out (4-12 s). [MMAudio](https://github.com/hkchengrex/MMAudio) as the reference model; `template/` for wrapping another one. |
+| [`generation/gateway/`](generation/gateway/README.md) | `generation-gateway` | 8010 | The same contract without a length limit: long requests in windows with crossfades, short ones padded, in front of the model service. The plugin and the hybrid service talk to this. |
 | [`search/`](search/README.md) | `sound-search-api` | 8002 | Video or prompt in, matching sounds out. X-CLIP embeddings over any indexed library: your own folders of sounds, the BBC Sound Effects Archive, or both. Also sound in, matching recordings out, located to the second: CLAP embeddings of 10 s windows of the files on disk. |
 | [`spotting/`](spotting/README.md) | `spotting-api` | 8003 | Video range in, sound events with timecodes out. A vision-language model describes the sounds a silent picture implies. |
 | [`hybrid/`](hybrid/README.md) | `hybrid-api` | 8004 | Video range in, one generated sound per sound event out, each with its own start and end; on request also library recordings that sound like each one, stitched from pieces. The reference implementation composes the services above. |
@@ -178,7 +179,10 @@ ways to provide it:
      that Ollama with `OLLAMA_HOST=0.0.0.0` (by default it listens on localhost
      only, which a container cannot reach);
    - LM Studio, vLLM or any other OpenAI-compatible server: `VLM_API=openai` and
-     for example `VLM_URL=http://host.docker.internal:1234`.
+     for example `VLM_URL=http://host.docker.internal:1234`;
+   - OpenAI itself, with no local model and no GPU for the spotting (the frames
+     leave the machine): `VLM_API=openai`, `VLM_URL=https://api.openai.com`, a
+     vision model in `VLM_MODEL` and the key in `VLM_API_KEY`.
 
 `VLM_MODEL` selects the model. It must carry a vision projector: plain
 `gemma4:e4b` silently ignores the images and answers from the text alone.
@@ -198,7 +202,7 @@ All settings are environment variables, listed with comments in
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `MMAUDIO_PORT`, `SOUND_SEARCH_PORT`, `SPOTTING_PORT`, `HYBRID_PORT` | `8000`, `8002`, `8003`, `8004` | Host ports the plugin's default profiles expect |
+| `MMAUDIO_PORT`, `GENERATION_PORT`, `SOUND_SEARCH_PORT`, `SPOTTING_PORT`, `HYBRID_PORT` | `8000`, `8010`, `8002`, `8003`, `8004` | Host ports; the plugin's default profiles expect the gateway (8010), search, spotting and hybrid |
 | `BUNDLED_OLLAMA` | `1` | `0` leaves the Ollama container out |
 | `VLM_URL`, `VLM_MODEL`, `VLM_API` | `http://ollama:11434`, `gemma4:e4b-it-qat`, `ollama` | Where and which the spotting model is |
 | `AUDIO_FETCH` | `on_demand` | `local_only` restricts the search to sounds already on disk |
@@ -206,7 +210,7 @@ All settings are environment variables, listed with comments in
 | `LIBRARIES_HOST_DIR` | `./data/libraries` | Your own sound libraries, one subfolder each |
 | `MMAUDIO_MODEL` | `large_44k_v2` | Which MMAudio variant to serve |
 | `CLAP_MODEL` | `laion/clap-htsat-fused` | Audio encoder for the search by sound; `embed_audio.py` and the API must agree |
-| `HYBRID_GEN_MIN_SECONDS`, `HYBRID_GEN_MAX_SECONDS` | `4`, `12` | The generation model's length window, used by the hybrid service |
+| `GATEWAY_MAX_SECONDS`, `GATEWAY_OVERLAP_SECONDS` | `600`, `1.0` | The longest sound the generation gateway makes, and the overlap between its crossfaded windows |
 | `FORCE_DEVICE` | `auto` | Leave at `auto`. The stack needs an NVIDIA GPU; `cpu` exists in the code but is far too slow to be useful |
 
 ## Connecting the plugin

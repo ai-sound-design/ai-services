@@ -193,7 +193,8 @@ services:
   # Talks to the model over VLM_URL. With BUNDLED_OLLAMA=0 set VLM_URL to the
   # server on the host, e.g. http://host.docker.internal:11434 for Ollama
   # (started with OLLAMA_HOST=0.0.0.0, since it binds to localhost only by
-  # default) or http://host.docker.internal:1234 with VLM_API=openai for LM Studio.
+  # default) or http://host.docker.internal:1234 with VLM_API=openai for LM Studio,
+  # or https://api.openai.com with VLM_API=openai and VLM_API_KEY for OpenAI itself.
   spotting-api:
     build:
       context: .
@@ -210,6 +211,7 @@ services:
       VLM_URL: ${VLM_URL:-http://ollama:11434}
       VLM_MODEL: ${VLM_MODEL:-gemma4:e4b-it-qat}
       VLM_API: ${VLM_API:-ollama}
+      VLM_API_KEY: ${VLM_API_KEY:-}
       SAMPLE_FPS: ${SPOTTING_SAMPLE_FPS:-2}
       FRAMES_PER_CALL: ${SPOTTING_FRAMES_PER_CALL:-8}
       VLM_NUM_CTX: ${VLM_NUM_CTX:-32768}
@@ -222,6 +224,26 @@ services:
   # ── Hybrid API: one generated sound per sound event ────────────────────────
   # Composes spotting-api, mmaudio-api and (for library matches) sound-search-api;
   # no model of its own, no GPU.
+  # The /generate contract without a length limit: windows, crossfades, padding, in
+  # front of the thin model service. The plugin's generation profile and the hybrid
+  # service talk to this, not to mmaudio-api, so a new model is a new thin container.
+  generation-gateway:
+    build:
+      context: .
+      dockerfile: generation/gateway/Dockerfile
+    image: ai-sound-design/generation-gateway:latest
+    restart: unless-stopped
+    depends_on:
+      mmaudio-api:
+        condition: service_started
+    ports:
+      - "${GENERATION_PORT:-8010}:8010"
+    environment:
+      GENERATION_MODEL_URL: http://mmaudio-api:8000
+      GATEWAY_MAX_SECONDS: ${GATEWAY_MAX_SECONDS:-600}
+      GATEWAY_OVERLAP_SECONDS: ${GATEWAY_OVERLAP_SECONDS:-1.0}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
   hybrid-api:
     build:
       context: .
@@ -229,7 +251,7 @@ services:
     image: ai-sound-design/hybrid-api:latest
     restart: unless-stopped
     depends_on:
-      mmaudio-api:
+      generation-gateway:
         condition: service_started
       spotting-api:
         condition: service_started
@@ -238,11 +260,9 @@ services:
     ports:
       - "${HYBRID_PORT:-8004}:8004"
     environment:
-      GENERATION_URL: http://mmaudio-api:8000
+      GENERATION_URL: http://generation-gateway:8010
       SPOTTING_URL: http://spotting-api:8003
       SEARCH_URL: http://sound-search-api:8002
-      GEN_MIN_SECONDS: ${HYBRID_GEN_MIN_SECONDS:-4}
-      GEN_MAX_SECONDS: ${HYBRID_GEN_MAX_SECONDS:-12}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - hybrid-output:/data/hybrid

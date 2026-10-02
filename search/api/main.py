@@ -281,6 +281,7 @@ async def search_by_audio(
     refine: bool = Form(True),
     exclude: Optional[str] = Form(None),
     envelope_weight: float = Form(0.3),
+    only: Optional[str] = Form(None),
 ):
     """
     Sounds that sound like the uploaded audio.
@@ -292,13 +293,16 @@ async def search_by_audio(
     length, so a two-second event is located to the quarter second.
     `exclude`: comma-separated sound ids to leave out. `envelope_weight` (0..1,
     default 0.3) blends the similarity of the loudness envelopes into the refined
-    score, so the match also moves like the query. Only sounds on disk are
-    indexed, so every result is available immediately.
+    score, so the match also moves like the query. `only`: comma-separated sound
+    ids to search inside, every one of them refined: a sketch search finds its
+    candidates by description first and lets the loudness shape pick the stretch.
+    Only sounds on disk are indexed, so every result is available immediately.
     """
     if clap is None:
         raise HTTPException(status_code=503, detail="Search by sound is off: the CLAP model is not loaded")
     libraries = [name.strip() for name in (library or "").split(",") if name.strip()] or None
     excluded = [int(x) for x in (exclude or "").split(",") if x.strip().isdigit()] or None
+    only_ids = [int(x) for x in (only or "").split(",") if x.strip().isdigit()] or None
     suffix = Path(audio_file.filename or "query.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
         handle.write(await audio_file.read())
@@ -316,8 +320,8 @@ async def search_by_audio(
     def work() -> dict:
         with clap_lock:
             query = _fused_query(samples, text, text_weight)
-            windows = db_client.window_search(query, limit=max(limit * 4, 20), libraries=libraries,
-                                              category=category, exclude=excluded)
+            windows = db_client.window_search(query, limit=max(limit * 4, 20) if not only_ids else len(only_ids) * 8,
+                                              libraries=libraries, category=category, exclude=excluded, only=only_ids)
             best_per_sound: dict[int, dict] = {}
             for window in windows:
                 if window["id"] not in best_per_sound:
@@ -326,7 +330,7 @@ async def search_by_audio(
             if refine:
                 # Locating the best stretch costs a decode and a dozen embeddings per candidate,
                 # so only the strongest few get it; the rest keep their window score.
-                top = min(len(candidates), REFINE_TOP)
+                top = len(candidates) if only_ids else min(len(candidates), REFINE_TOP)
                 candidates = [_refine(c, query, min(query_length, audio.WINDOW_SECONDS), samples,
                                       max(0.0, min(1.0, envelope_weight))) for c in candidates[:top]] + candidates[top:]
                 candidates.sort(key=lambda c: c["similarity"], reverse=True)

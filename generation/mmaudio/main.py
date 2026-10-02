@@ -735,12 +735,17 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for API availability verification"""
+    """Health check endpoint for API availability verification.
+
+    `capabilities` is what the generation gateway reads: one call makes 4-12 s of
+    audio from a video (v2a) or a prompt alone (t2a); MMAudio takes no audio context,
+    so longer sounds are the gateway's job (windows with a crossfade)."""
     return {
         "status": "ok",
         "service": "MMAudio Standalone API",
         "device": device,
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "capabilities": {"min_seconds": 4, "max_seconds": 12, "modes": ["v2a", "t2a"], "continuation": False}
     }
 
 @app.get("/models")
