@@ -9,7 +9,8 @@
 -- search compares a video (or a prompt) against the description's X-CLIP text
 -- embedding. A second table, sound_windows, holds CLAP audio embeddings of
 -- 10 s windows of the files that are on disk, for search by sound
--- (/search/by_audio); embed_audio.py fills it.
+-- (/search/by_audio); embed_audio.py fills it. sound_segments and sound_fine
+-- hold the finer adaptive index that replaces it (embed_segments.py).
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -59,6 +60,37 @@ CREATE INDEX IF NOT EXISTS idx_sound_windows_sound ON sound_windows (sound_id);
 CREATE INDEX IF NOT EXISTS idx_audio_emb ON sound_windows
     USING hnsw (audio_embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 
+-- The adaptive index (embed_segments.py): every file as CLAP windows of 2 s on a
+-- 1 s grid, consecutive windows that sound alike merged into one segment (the
+-- mean of their vectors). A run of miaows becomes one segment per miaow, a
+-- three-minute room tone a handful; a short event is found by a vector of its
+-- own length instead of drowning in a 10 s window. halfvec halves the storage
+-- and the index at no measurable cost in similarity.
+CREATE TABLE IF NOT EXISTS sound_segments (
+    id               BIGSERIAL PRIMARY KEY,
+    sound_id         INTEGER NOT NULL REFERENCES sounds(id) ON DELETE CASCADE,
+    start_seconds    DOUBLE PRECISION NOT NULL,
+    end_seconds      DOUBLE PRECISION NOT NULL,
+    audio_embedding  halfvec(512) NOT NULL,      -- CLAP, mean of the segment's 2 s windows
+    UNIQUE (sound_id, start_seconds)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sound_segments_sound ON sound_segments (sound_id);
+CREATE INDEX IF NOT EXISTS idx_segment_emb ON sound_segments
+    USING hnsw (audio_embedding halfvec_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+-- The 2 s windows themselves, one row per sound and not indexed: the search uses
+-- them to find the best stretch inside a matched segment without decoding the
+-- file and running CLAP again. `vectors` is float16, len(offsets) x 512, row-major;
+-- `levels` the RMS of each window in dBFS.
+CREATE TABLE IF NOT EXISTS sound_fine (
+    sound_id        INTEGER PRIMARY KEY REFERENCES sounds(id) ON DELETE CASCADE,
+    window_seconds  REAL NOT NULL,
+    offsets         REAL[] NOT NULL,
+    levels          REAL[] NOT NULL,
+    vectors         BYTEA NOT NULL
+);
+
 DROP VIEW IF EXISTS library_stats;
 CREATE VIEW library_stats AS
     SELECT library,
@@ -67,6 +99,8 @@ CREATE VIEW library_stats AS
            COUNT(*) FILTER (WHERE file_exists)                  AS local_files,
            COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM sound_windows w WHERE w.sound_id = sounds.id))
                                                                 AS audio_indexed,
+           COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM sound_fine f WHERE f.sound_id = sounds.id))
+                                                                AS segment_indexed,
            SUM(duration_seconds) / 3600.0                       AS hours
     FROM sounds
     GROUP BY library

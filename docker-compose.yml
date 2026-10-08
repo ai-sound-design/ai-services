@@ -57,15 +57,20 @@ services:
       # Set to 0 only to debug a start-up problem.
       MMAUDIO_PREFETCH: ${MMAUDIO_PREFETCH:-1}
       MMAUDIO_MODEL: ${MMAUDIO_MODEL:-large_44k_v2}
+      # Every model of the stack lives under /models: MMAudio's weights, the
+      # Hugging Face and torch caches (see MODELS_STORE below).
+      HF_HOME: /models/huggingface
+      TORCH_HOME: /models/torch
     volumes:
       # The entrypoint downloads the weights before the server starts, so they
-      # are on disk before the first request. MMAudio resolves its checkpoint
-      # paths relative to the working directory: they must be mounted at
-      # /app/api, not under /opt/MMAudio.
-      - mmaudio-weights:/app/api/weights
-      - mmaudio-ext-weights:/app/api/ext_weights
-      - hf-cache:/cache/huggingface
-      - torch-cache:/cache/torch
+      # are on disk before the first request. MODELS_STORE is the Docker volume
+      # "models" unless .env names a folder instead: a volume lives in Docker's
+      # own disk, where a 6 GB model loads in seconds; a folder on Windows or
+      # macOS is visible in Explorer/Finder but loads it through the file
+      # sharing of Docker Desktop, in minutes. MMAudio resolves its checkpoint
+      # paths relative to the working directory, so the entrypoint links
+      # /app/api/weights to /models/mmaudio/weights.
+      - ${MODELS_STORE:-models}:/models
     # Shared memory for PyTorch dataloaders; the 64 MB default is too small.
     shm_size: "2gb"
     <<: *gpu
@@ -112,11 +117,17 @@ services:
       AUDIO_FETCH: ${AUDIO_FETCH:-on_demand}
       # Audio embeddings for the search by sound; the same model the indexer used.
       CLAP_MODEL: ${CLAP_MODEL:-laion/clap-htsat-fused}
+      HF_HOME: /models/huggingface
     volumes:
       # Plain host folders so the audio is visible in Explorer/Finder.
+      # An existing copy of the BBC archive (BBC_ARCHIVE_HOST_DIR) and a folder of
+      # your own sounds (OWN_SOUNDS_HOST_DIR) are read, never written; register.py
+      # and the setup page point the index at them.
       - ${AUDIO_HOST_DIR:-./data/audio}:/data/audio
       - ${LIBRARIES_HOST_DIR:-./data/libraries}:/data/libraries:ro
-      - hf-cache:/cache/huggingface
+      - ${OWN_SOUNDS_HOST_DIR:-./data/own-sounds}:/data/own-sounds:ro
+      - ${BBC_ARCHIVE_HOST_DIR:-./data/archive}:/data/archive:ro
+      - ${MODELS_STORE:-models}:/models
     shm_size: "1gb"
     <<: *gpu
 
@@ -141,19 +152,64 @@ services:
       DATABASE_URL: *database-url
       BBC_AUDIO_FORMAT: ${BBC_AUDIO_FORMAT:-mp3}
       CLAP_MODEL: ${CLAP_MODEL:-laion/clap-htsat-fused}
+      HF_HOME: /models/huggingface
     volumes:
       - ${AUDIO_HOST_DIR:-./data/audio}:/data/audio
       - ${LIBRARIES_HOST_DIR:-./data/libraries}:/data/libraries:ro
-      - hf-cache:/cache/huggingface
+      - ${OWN_SOUNDS_HOST_DIR:-./data/own-sounds}:/data/own-sounds:ro
+      - ${BBC_ARCHIVE_HOST_DIR:-./data/archive}:/data/archive:ro
+      - ${MODELS_STORE:-models}:/models
+    <<: *gpu
+
+  # ── Setup page: what is installed and indexed, with progress (port 8020) ───
+  # The indexer's scripts run inside it as steps that can be paused and resumed;
+  # install.ps1 opens it after the first start. The Docker socket is optional: with
+  # it the page shows the state of the other containers while they fetch their
+  # models.
+  setup:
+    build:
+      context: .
+      dockerfile: setup/Dockerfile
+    image: ai-sound-design/setup:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${SETUP_PORT:-8020}:8020"
+    environment:
+      DATABASE_URL: *database-url
+      BBC_AUDIO_FORMAT: ${BBC_AUDIO_FORMAT:-mp3}
+      CLAP_MODEL: ${CLAP_MODEL:-laion/clap-htsat-fused}
+      HF_HOME: /models/huggingface
+      VLM_URL: ${VLM_URL:-http://ollama:11434}
+      VLM_API: ${VLM_API:-ollama}
+      VLM_MODEL: ${VLM_MODEL:-gemma4:e4b-it-qat}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OWN_SOUNDS_NAME: ${OWN_SOUNDS_NAME:-own}
+      # Shown on the page: where the models and the database live
+      MODELS_STORE: ${MODELS_STORE:-models}
+      OLLAMA_MODELS_STORE: ${OLLAMA_MODELS_STORE:-ollama-models}
+      AUDIO_HOST_DIR: ${AUDIO_HOST_DIR:-./data/audio}
+      LIBRARIES_HOST_DIR: ${LIBRARIES_HOST_DIR:-./data/libraries}
+    volumes:
+      - ${AUDIO_HOST_DIR:-./data/audio}:/data/audio
+      - ${LIBRARIES_HOST_DIR:-./data/libraries}:/data/libraries:ro
+      - ${OWN_SOUNDS_HOST_DIR:-./data/own-sounds}:/data/own-sounds:ro
+      - ${BBC_ARCHIVE_HOST_DIR:-./data/archive}:/data/archive:ro
+      - ${MODELS_STORE:-models}:/models
+      - ${OLLAMA_MODELS_STORE:-ollama-models}:/models-ollama:ro
+      - setup-logs:/data/setup
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     <<: *gpu
 
   # ── Ollama: hosts the vision-language model for spotting ───────────────────
   # BUNDLED_OLLAMA=0 in .env leaves this container out (replicas: 0); spotting
-  # then talks to whatever VLM_URL names. Point OLLAMA_MODELS_HOST_DIR at an
-  # existing Ollama model store (for example C:/Users/<you>/.ollama on Windows)
-  # and the container uses those weights instead of downloading them again. The
-  # default is an empty folder next to this file; the command below pulls
-  # VLM_MODEL into it on first start.
+  # then talks to whatever VLM_URL names. The model store is the Docker volume
+  # "ollama-models" unless OLLAMA_MODELS_STORE names a folder, for example an
+  # existing Ollama store on the host (C:/Users/<you>/.ollama on Windows), whose
+  # weights are then used instead of downloaded again. The command below pulls
+  # VLM_MODEL into the store on first start.
   ollama:
     image: ollama/ollama:latest
     restart: unless-stopped
@@ -163,7 +219,7 @@ services:
       # Keep the model resident: a cold load with the 32k context takes minutes.
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-1h}
     volumes:
-      - ${OLLAMA_MODELS_HOST_DIR:-./data/ollama}:/root/.ollama
+      - ${OLLAMA_MODELS_STORE:-ollama-models}:/root/.ollama
     entrypoint: ["/bin/sh", "-c"]
     # Serve, wait for the API, make sure the model is present, then keep serving.
     command:
@@ -214,6 +270,18 @@ services:
       VLM_API_KEY: ${VLM_API_KEY:-}
       SAMPLE_FPS: ${SPOTTING_SAMPLE_FPS:-2}
       FRAMES_PER_CALL: ${SPOTTING_FRAMES_PER_CALL:-8}
+      CUT_DETECTION: ${SPOTTING_CUT_DETECTION:-1}
+      CUT_THRESHOLD: ${SPOTTING_CUT_THRESHOLD:-0.3}
+      CUT_MIN_PIECE_S: ${SPOTTING_CUT_MIN_PIECE_S:-0.3}
+      SCENE_CONTEXT: ${SPOTTING_SCENE_CONTEXT:-1}
+      SCENE_FPS: ${SPOTTING_SCENE_FPS:-0.25}
+      SCENE_CHECKLIST: ${SPOTTING_SCENE_CHECKLIST:-0}
+      EVENT_EVIDENCE: ${SPOTTING_EVENT_EVIDENCE:-0}
+      EVENT_OBSERVE: ${SPOTTING_EVENT_OBSERVE:-0}
+      SCENE_HINT: ${SPOTTING_SCENE_HINT:-place}
+      MIN_SCENE_S: ${SPOTTING_MIN_SCENE_S:-10}
+      MERGE_GAP_S: ${SPOTTING_MERGE_GAP_S:-2.0}
+      VLM_NUM_PREDICT: ${SPOTTING_VLM_NUM_PREDICT:-2048}
       VLM_NUM_CTX: ${VLM_NUM_CTX:-32768}
       FRAME_STAMP: ${FRAME_STAMP:-1}
       VLM_TEMPERATURE: ${VLM_TEMPERATURE:-0}
@@ -263,14 +331,15 @@ services:
       GENERATION_URL: http://generation-gateway:8010
       SPOTTING_URL: http://spotting-api:8003
       SEARCH_URL: http://sound-search-api:8002
+      CANDIDATES_BY_TEXT: ${HYBRID_CANDIDATES_BY_TEXT:-20}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - hybrid-output:/data/hybrid
 
 volumes:
+  setup-logs:
   hybrid-output:
-  mmaudio-weights:
-  mmaudio-ext-weights:
-  hf-cache:
-  torch-cache:
   postgres-data:
+  # The models (unused when .env points MODELS_STORE / OLLAMA_MODELS_STORE at folders)
+  models:
+  ollama-models:

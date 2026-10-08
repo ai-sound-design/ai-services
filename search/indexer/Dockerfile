@@ -4,6 +4,7 @@
 #   index_folder.py         a folder of your own sounds -> library rows + embeddings
 #   embed.py                X-CLIP text embeddings for rows that lack them
 #   embed_audio.py          CLAP audio embeddings (10 s windows) for files on disk
+#   embed_segments.py       the adaptive audio index (2 s windows merged into segments)
 #   sources/bbc/harvest.py  BBC Sound Effects metadata from the public API
 #   sources/bbc/download.py the BBC audio, for offline use
 #

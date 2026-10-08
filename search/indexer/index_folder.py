@@ -165,9 +165,9 @@ def main() -> int:
 
     if not args.no_embed and rows:
         from embed import embed_missing
-        from embed_audio import embed_pending
+        from embed_segments import embed_pending
         embed_missing(connection, library=args.library)
-        embed_pending(connection, library=args.library)
+        embed_pending(connection, library=args.library)      # the adaptive audio index
 
     for stat in db.library_stats(connection):
         if stat["library"] == args.library:

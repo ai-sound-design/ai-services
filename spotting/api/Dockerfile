@@ -5,7 +5,8 @@
 FROM python:3.12-slim
 
 # fonts-dejavu-core: the font ffmpeg uses to burn the timestamp into each frame.
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core \
+# libglib2.0-0: wanted by OpenCV, which PySceneDetect reads the frames with (cut detection).
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1

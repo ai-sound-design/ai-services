@@ -22,6 +22,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -51,7 +52,13 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 encoder: Optional[XCLIPEncoder] = None
 clap: Optional[audio.ClapEncoder] = None
 clap_lock = threading.Lock()
-REFINE_TOP = int(os.getenv("REFINE_TOP", "4"))          # candidates that get the fine search
+REFINE_TOP = int(os.getenv("REFINE_TOP", "0"))          # candidates that get the fine search, 0: all returned
+QUIET_BELOW_QUERY_DB = float(os.getenv("QUIET_BELOW_QUERY_DB", "20"))  # refine skips stretches this much quieter
+# Which audio index the search by sound uses: segments (the adaptive index of
+# embed_segments.py), windows (the 10 s windows), or auto: the segments once every
+# sound with windows has them, checked every few minutes while the indexer runs.
+AUDIO_INDEX = os.getenv("AUDIO_INDEX", "auto").strip().lower()
+_segments_state = {"ready": False, "checked": 0.0}
 db_client: Optional[DatabaseClient] = None
 _fetch_locks: dict[int, asyncio.Lock] = {}
 
@@ -102,6 +109,7 @@ async def health_check():
     try:
         stats = db_client.get_stats()
         windows = db_client.audio_windows()
+        segments = db_client.audio_segments()
         return {"status": "ok", "model": encoder.model_name if encoder else MODEL_NAME, "device": DEVICE,
                 "database": "connected", "audio_fetch": AUDIO_FETCH,
                 "libraries": {s["library"]: {"sounds": s["sounds"], "embedded": s["embedded"],
@@ -113,6 +121,8 @@ async def health_check():
                 "audio_search": {"available": clap is not None and windows["windows"] > 0,
                                  "model": clap.model_name if clap else None,
                                  "windows": windows["windows"], "sounds": windows["sounds"],
+                                 "index": "segments" if _use_segments() else "windows",
+                                 "segments": segments["segments"], "segmented_sounds": segments["sounds"],
                                  "reason": None if clap is None or windows["windows"] > 0 else
                                            "no audio windows yet: run embed_audio.py"
                                            if clap is not None else "CLAP model not loaded"}}
@@ -224,6 +234,10 @@ def _envelope(samples: np.ndarray, hop: float = 0.05) -> np.ndarray:
     return rms / (rms.mean() or 1.0)
 
 
+def _rms_db(samples: np.ndarray) -> float:
+    return float(10.0 * np.log10(np.mean(np.asarray(samples, dtype=np.float64) ** 2) + 1e-12))
+
+
 def _envelope_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """1 for the same loudness shape, towards 0 the more the shapes differ."""
     n = min(len(a), len(b))
@@ -255,6 +269,13 @@ def _refine(candidate: dict, query: np.ndarray, piece_length: float,
     hop = max(0.25, length / 4)
     offsets = [round(i * hop, 3) for i in range(int((len(region) / audio.SAMPLE_RATE - length) // hop) + 1)]
     pieces = [audio.slice_window(region, o, length) for o in offsets]
+    # A stretch far quieter than the query (a pause between two miaows) is no match,
+    # whatever CLAP makes of near-silence; kept only if the whole region is that quiet
+    if query_samples is not None and len(pieces) > 1:
+        wanted = _rms_db(query_samples[:int(length * audio.SAMPLE_RATE)])
+        loud = [(o, p) for o, p in zip(offsets, pieces) if _rms_db(p) >= wanted - QUIET_BELOW_QUERY_DB]
+        if loud:
+            offsets, pieces = [o for o, _ in loud], [p for _, p in loud]
     vectors = clap.encode_audio(pieces)
     scores = vectors @ query
     if envelope_weight > 0 and query_samples is not None:
@@ -266,6 +287,85 @@ def _refine(candidate: dict, query: np.ndarray, piece_length: float,
     refined["window_similarity"] = candidate["similarity"]
     refined["similarity"] = round(float(scores[best]), 4)
     refined["offset_seconds"] = round(region_start + offsets[best], 3)
+    refined["length_seconds"] = round(length, 3)
+    return refined
+
+
+def _use_segments() -> bool:
+    if AUDIO_INDEX in ("segments", "windows"):
+        return AUDIO_INDEX == "segments"
+    if not _segments_state["ready"] and time.time() - _segments_state["checked"] > 300:
+        _segments_state["checked"] = time.time()
+        try:
+            _segments_state["ready"] = db_client.segments_ready()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not check the segment index: %s", exc)
+        if _segments_state["ready"]:
+            logger.info("the segment index covers every sound: search by sound uses it from now on")
+    return _segments_state["ready"]
+
+
+def _refine_fine(candidate: dict, query: np.ndarray, piece_length: float,
+                 query_samples: Optional[np.ndarray] = None, envelope_weight: float = 0.0) -> dict:
+    """Locate the best `piece_length` seconds of a matched sound. The stored 2 s windows
+    pick the best window without a CLAP run (a piece up to 2 s is scored by the window
+    it lies in, a longer one by the mean of the windows it covers); the whole sound is
+    searched, not only the segment that matched, since a segment's vector is the mean
+    of its windows and the best single stretch can lie in a long, even segment that
+    ranked lower. Then only that window and half a second around it is decoded, CLAP
+    scores the stretches of the piece's length in it, and the loudness envelope blends
+    in as in _refine: the precision of the old fine search at a fraction of its cost."""
+    fine = db_client.fine_windows(int(candidate["id"]))
+    if fine is None:
+        return _refine(candidate, query, min(piece_length, audio.WINDOW_SECONDS), query_samples, envelope_weight)
+    offsets, levels, vectors, width = fine["offsets"], fine["levels"], fine["vectors"], fine["window_seconds"]
+    duration = float(offsets[-1]) + width
+    length = min(piece_length, duration)
+    places = [i for i, o in enumerate(offsets) if o + min(length, width) <= duration + 0.01]         or list(range(len(offsets)))
+    # Pauses are no match, whatever CLAP made of them (as in _refine)
+    if query_samples is not None:
+        wanted_db = _rms_db(query_samples[:int(min(length, width) * audio.SAMPLE_RATE)])
+        places = [i for i in places if levels[i] >= wanted_db - QUIET_BELOW_QUERY_DB] or places
+    if length <= width:
+        clap_scores = vectors[places] @ query
+    else:
+        means = []
+        for i in places:
+            inside = [j for j in range(i, len(offsets)) if offsets[j] + width <= offsets[i] + length + 0.01]
+            mean = vectors[inside or [i]].mean(axis=0)
+            means.append(mean / (float(np.linalg.norm(mean)) or 1.0))
+        clap_scores = np.asarray(means) @ query
+    best = places[int(np.argmax(clap_scores))]
+    clap_score = float(np.max(clap_scores))
+    offset, score = float(offsets[best]), clap_score
+    if query_samples is not None and length <= audio.WINDOW_SECONDS:
+        # The exact stretch inside the best window (and half a second around it): CLAP on
+        # every stretch of the piece's length, the loudness shape blended in
+        region_start = max(0.0, offset - 0.5)
+        try:
+            region = audio.decode(candidate["file_path"], start=region_start, length=max(length, width) + 1.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("refine: could not decode %s: %s", candidate["file_path"], exc)
+            region = None
+        if region is not None and len(region) / audio.SAMPLE_RATE >= length:
+            hop = 0.1 if length <= 3.0 else 0.25
+            steps = [round(k * hop, 3) for k in range(int((len(region) / audio.SAMPLE_RATE - length) / hop) + 1)]
+            pieces = [audio.slice_window(region, step, length) for step in steps]
+            wanted_db = _rms_db(query_samples[:int(length * audio.SAMPLE_RATE)])
+            loud = [k for k, piece in enumerate(pieces) if _rms_db(piece) >= wanted_db - QUIET_BELOW_QUERY_DB]
+            if loud:
+                steps, pieces = [steps[k] for k in loud], [pieces[k] for k in loud]
+            scores = clap.encode_audio(pieces) @ query
+            if envelope_weight > 0:
+                wanted = _envelope(query_samples[:int(length * audio.SAMPLE_RATE)])
+                shapes = np.array([_envelope_similarity(wanted, _envelope(piece)) for piece in pieces])
+                scores = (1 - envelope_weight) * scores + envelope_weight * shapes
+            k = int(np.argmax(scores))
+            offset, score = region_start + steps[k], float(scores[k])
+    refined = dict(candidate)
+    refined["window_similarity"] = candidate["similarity"]
+    refined["similarity"] = round(float(score), 4)
+    refined["offset_seconds"] = round(offset, 3)
     refined["length_seconds"] = round(length, 3)
     return refined
 
@@ -282,12 +382,15 @@ async def search_by_audio(
     exclude: Optional[str] = Form(None),
     envelope_weight: float = Form(0.3),
     only: Optional[str] = Form(None),
+    refine_top: Optional[int] = Form(None),
+    index: Optional[str] = Form(None),
 ):
     """
     Sounds that sound like the uploaded audio.
 
-    The audio is embedded with CLAP and compared with the 10 s windows of the
-    indexed files. With `text` and a `text_weight` above 0 the description is
+    The audio is embedded with CLAP and compared with the segments of the
+    adaptive index (2 s windows merged where they sound alike), or with the 10 s
+    windows of the indexed files while that index is incomplete (AUDIO_INDEX). With `text` and a `text_weight` above 0 the description is
     blended in (CLAP shares one space for both). `refine` (default on) then
     looks inside each matched window for the best stretch of the query's
     length, so a two-second event is located to the quarter second.
@@ -296,6 +399,12 @@ async def search_by_audio(
     score, so the match also moves like the query. `only`: comma-separated sound
     ids to search inside, every one of them refined: a sketch search finds its
     candidates by description first and lets the loudness shape pick the stretch.
+    `refine_top`: how many of the strongest candidates get the fine search (default
+    REFINE_TOP, 0: every result, since a caller cuts a result at its offset); the others
+    keep the start of their segment or window and its score, marked `refined: false`.
+    On the segment index the fine search reads the stored 2 s windows instead of
+    running CLAP again, so it costs a short decode per candidate. `index`
+    (segments or windows) overrides AUDIO_INDEX for this request.
     Only sounds on disk are indexed, so every result is available immediately.
     """
     if clap is None:
@@ -318,26 +427,30 @@ async def search_by_audio(
     query_length = len(samples) / audio.SAMPLE_RATE
 
     def work() -> dict:
+        segments = index == "segments" or (index != "windows" and _use_segments())
+        search, fine = (db_client.segment_search, _refine_fine) if segments else (db_client.window_search, _refine)
         with clap_lock:
             query = _fused_query(samples, text, text_weight)
-            windows = db_client.window_search(query, limit=max(limit * 4, 20) if not only_ids else len(only_ids) * 8,
-                                              libraries=libraries, category=category, exclude=excluded, only=only_ids)
+            windows = search(query, limit=max(limit * 4, 20) if not only_ids else len(only_ids) * 8,
+                             libraries=libraries, category=category, exclude=excluded, only=only_ids)
             best_per_sound: dict[int, dict] = {}
             for window in windows:
                 if window["id"] not in best_per_sound:
                     best_per_sound[window["id"]] = window
             candidates = list(best_per_sound.values())[:limit]
             if refine:
-                # Locating the best stretch costs a decode and a dozen embeddings per candidate,
-                # so only the strongest few get it; the rest keep their window score.
-                top = len(candidates) if only_ids else min(len(candidates), REFINE_TOP)
-                candidates = [_refine(c, query, min(query_length, audio.WINDOW_SECONDS), samples,
-                                      max(0.0, min(1.0, envelope_weight))) for c in candidates[:top]] + candidates[top:]
+                top = len(candidates) if only_ids else min(len(candidates), refine_top or REFINE_TOP or len(candidates))
+                length = query_length if segments else min(query_length, audio.WINDOW_SECONDS)
+                candidates = [fine(c, query, length, samples, max(0.0, min(1.0, envelope_weight)))
+                              for c in candidates[:top]] + candidates[top:]
+                for candidate in candidates:
+                    candidate["refined"] = "window_similarity" in candidate
                 candidates.sort(key=lambda c: c["similarity"], reverse=True)
         for candidate in candidates:
             candidate.pop("file_path", None)
         return {"query_seconds": round(query_length, 3), "text": text, "text_weight": text_weight,
-                "libraries": libraries, "count": len(candidates), "results": candidates}
+                "libraries": libraries, "index": "segments" if segments else "windows",
+                "count": len(candidates), "results": candidates}
 
     try:
         return await asyncio.to_thread(work)

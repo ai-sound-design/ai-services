@@ -106,6 +106,21 @@ class DatabaseClient:
                       exclude: Optional[list[int]] = None, only: Optional[list[int]] = None) -> list[dict[str, Any]]:
         """Nearest 10 s audio windows (CLAP) with their sound's metadata. `only`: look
         inside these sounds alone (a sketch search names its candidates by description first)."""
+        return self._audio_search("sound_windows", "vector", "w.offset_seconds, w.length_seconds",
+                                  query_embedding, limit, libraries, category, exclude, only)
+
+    def segment_search(self, query_embedding: np.ndarray, limit: int = 40,
+                       libraries: Optional[list[str]] = None, category: Optional[str] = None,
+                       exclude: Optional[list[int]] = None, only: Optional[list[int]] = None) -> list[dict[str, Any]]:
+        """Nearest segments of the adaptive index, in the same form as window_search:
+        `offset_seconds`/`length_seconds` are the segment's start and length."""
+        return self._audio_search("sound_segments", "halfvec",
+                                  "w.start_seconds AS offset_seconds, w.end_seconds - w.start_seconds AS length_seconds",
+                                  query_embedding, limit, libraries, category, exclude, only)
+
+    def _audio_search(self, table: str, vector_type: str, span: str, query_embedding: np.ndarray, limit: int,
+                      libraries: Optional[list[str]], category: Optional[str],
+                      exclude: Optional[list[int]], only: Optional[list[int]]) -> list[dict[str, Any]]:
         embedding = query_embedding.tolist()
         conditions, params = ["TRUE"], []
         if libraries:
@@ -124,11 +139,11 @@ class DatabaseClient:
             with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
                     "SELECT s.id, s.library, s.external_id, s.description, s.category, s.collection, "
-                    "       s.duration_seconds, s.file_path, w.offset_seconds, w.length_seconds, "
-                    "       1 - (w.audio_embedding <=> %s::vector) AS similarity "
-                    "FROM sound_windows w JOIN sounds s ON s.id = w.sound_id "
+                    f"       s.duration_seconds, s.file_path, {span}, "
+                    f"       1 - (w.audio_embedding <=> %s::{vector_type}) AS similarity "
+                    f"FROM {table} w JOIN sounds s ON s.id = w.sound_id "
                     f"WHERE {' AND '.join(conditions)} "
-                    "ORDER BY w.audio_embedding <=> %s::vector LIMIT %s",
+                    f"ORDER BY w.audio_embedding <=> %s::{vector_type} LIMIT %s",
                     [embedding] + params + [embedding, limit])
                 results = []
                 for row in cursor.fetchall():
@@ -139,6 +154,35 @@ class DatabaseClient:
         except Exception:
             self.conn.rollback()
             raise
+
+    def fine_windows(self, sound_id: int) -> Optional[dict[str, Any]]:
+        """The 2 s windows of one sound from the adaptive index: window_seconds, offsets,
+        levels (dBFS) and vectors (float32, one row per window); None if not indexed."""
+        with self.conn.cursor() as cursor:
+            cursor.execute("SELECT window_seconds, offsets, levels, vectors FROM sound_fine WHERE sound_id = %s",
+                           (sound_id,))
+            row = cursor.fetchone()
+        if not row:
+            return None
+        offsets = np.asarray(row[1], dtype=np.float32)
+        vectors = np.frombuffer(bytes(row[3]), dtype=np.float16).astype(np.float32).reshape(len(offsets), -1)
+        return {"window_seconds": float(row[0]), "offsets": offsets,
+                "levels": np.asarray(row[2], dtype=np.float32), "vectors": vectors}
+
+    def segments_ready(self) -> bool:
+        """True once every sound with 10 s windows also has its segments."""
+        with self.conn.cursor() as cursor:
+            cursor.execute("SELECT EXISTS (SELECT 1 FROM sound_segments) AND NOT EXISTS ("
+                           "  SELECT 1 FROM sounds s WHERE s.file_exists"
+                           "  AND EXISTS (SELECT 1 FROM sound_windows w WHERE w.sound_id = s.id)"
+                           "  AND NOT EXISTS (SELECT 1 FROM sound_fine f WHERE f.sound_id = s.id))")
+            return bool(cursor.fetchone()[0])
+
+    def audio_segments(self) -> dict[str, int]:
+        with self.conn.cursor() as cursor:
+            cursor.execute("SELECT (SELECT COUNT(*) FROM sound_segments), (SELECT COUNT(*) FROM sound_fine)")
+            segments, sounds = cursor.fetchone()
+        return {"segments": int(segments), "sounds": int(sounds)}
 
     def audio_windows(self) -> dict[str, int]:
         with self.conn.cursor() as cursor:

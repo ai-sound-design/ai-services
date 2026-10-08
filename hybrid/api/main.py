@@ -134,6 +134,42 @@ async def spot_events(video: Path, start_timecode: str, fps: float,
     return body.get("events", []), body.get("model")
 
 
+async def clip_cuts(video: Path) -> list[float]:
+    """The picture cuts inside the clip, from the spotting service; [] when it cannot tell."""
+    try:
+        async with httpx.AsyncClient(timeout=SPOTTING_TIMEOUT_S) as client:
+            with video.open("rb") as handle:
+                response = await client.post(f"{SPOTTING_URL}/cuts",
+                                             files={"video": (video.name, handle, "video/mp4")})
+        if response.status_code != 200:
+            log.warning("cuts: spotting service answered %s", response.status_code)
+            return []
+        return [float(c) for c in response.json().get("cuts", [])]
+    except (httpx.HTTPError, ValueError) as exc:
+        log.warning("cuts: %s", exc)
+        return []
+
+
+CUT_SPLIT_CATEGORIES = ("foley", "sfx")
+CUT_MIN_PIECE_S = 0.3
+
+
+def split_at_cuts(events: list[dict], cuts: list[float]) -> list[dict]:
+    """Events the editor gave as markers, split at the picture cuts like spotted ones:
+    a foley or effect changes with the shot, ambience, music and dialogue carry on."""
+    out: list[dict] = []
+    for event in events:
+        start, end = float(event["start_seconds"]), float(event["end_seconds"])
+        if str(event.get("category", "")).lower() not in CUT_SPLIT_CATEGORIES:
+            out.append(event)
+            continue
+        edges = [start] + [c for c in cuts if start < c < end] + [end]
+        for a, b in zip(edges, edges[1:]):
+            if b - a >= CUT_MIN_PIECE_S:
+                out.append({**event, "start_seconds": round(a, 3), "end_seconds": round(b, 3)})
+    return out
+
+
 # What an effect, a foley or an atmosphere should not contain; an event that IS speech
 # or music must not get this, it would fight the prompt
 VOICES_AND_MUSIC = "voices, music, melody, singing, speech, interference"
@@ -423,6 +459,12 @@ async def hybrid(
         model = None
         if given:
             found, source = given, "memory_locations"
+            cuts = await clip_cuts(src)
+            if cuts:
+                before = len(found)
+                found = split_at_cuts(found, cuts)
+                log.info("%s: %d cut(s) at %s; %d marker events -> %d", src.name, len(cuts),
+                         ", ".join(f"{c:.1f}s" for c in cuts), before, len(found))
         else:
             set_progress(job_id, stage="spotting", fraction=0.0, detail="spotting")
             found, model = await spot_events(src, start_timecode, fps, job_id, categories)

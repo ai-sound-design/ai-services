@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Sound Design: setup</title>
+<style>
+  :root { --bg: #1b1d20; --panel: #25282c; --line: #34383d; --text: #e8e8e8; --dim: #9aa0a6; --ok: #5ec26a; --warn: #f5b700; --bad: #e5533d; --accent: #4a9eff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 "Segoe UI", system-ui, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 15px; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; margin: 28px 0 10px; }
+  .sub { color: var(--dim); margin: 0 0 8px; }
+  section.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 4px 16px; }
+  .row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .row:last-child { border-bottom: 0; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--dim); }
+  .dot.ok { background: var(--ok); } .dot.starting { background: var(--warn); } .dot.down { background: var(--bad); }
+  .name { min-width: 260px; }
+  .detail { color: var(--dim); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .step { padding: 14px 0; border-bottom: 1px solid var(--line); }
+  .step:last-child { border-bottom: 0; }
+  .head { display: flex; align-items: center; gap: 12px; }
+  .head .title { font-weight: 600; flex: 1; }
+  .state { font-size: 13px; color: var(--dim); padding: 2px 8px; border: 1px solid var(--line); border-radius: 12px; }
+  .state.running { color: var(--accent); border-color: var(--accent); }
+  .state.complete { color: var(--ok); border-color: var(--ok); }
+  .state.error { color: var(--bad); border-color: var(--bad); }
+  .state.paused, .state.interrupted, .state.partial { color: var(--warn); border-color: var(--warn); }
+  .about { color: var(--dim); font-size: 13px; margin: 4px 0 8px; }
+  .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 6px 0 4px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .4s; }
+  .bar.done > i { background: var(--ok); }
+  .meta { display: flex; justify-content: space-between; font-size: 13px; color: var(--dim); }
+  pre.log { margin: 8px 0 0; padding: 8px 10px; background: #141618; border-radius: 6px; color: var(--dim); font: 12px/1.4 Consolas, monospace; white-space: pre-wrap; max-height: 70px; overflow: hidden; }
+  button { background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .4; cursor: default; }
+  .toolbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 14px 0; }
+  .err { color: var(--bad); font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; }
+  td.num, th.num { text-align: right; }
+  footer { color: var(--dim); font-size: 13px; margin-top: 24px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>AI Sound Design: setup</h1>
+  <p class="sub">The services of the backend, their models, and the sound index. Every step can be paused and carries on where it stopped.</p>
+
+  <h2>Services</h2>
+  <section class="panel" id="services"></section>
+
+  <h2>Models</h2>
+  <section class="panel" id="models"></section>
+
+  <h2>Sound index</h2>
+  <section class="panel">
+    <div class="row" id="search-summary"></div>
+    <div class="toolbar">
+      <button class="primary" id="pipeline-start">Set everything up</button>
+      <button id="pipeline-stop">Stop</button>
+      <label><input type="checkbox" id="download" checked> download the BBC audio files (about 10 GB)</label>
+      <span class="detail" id="pipeline-state"></span>
+    </div>
+    <div id="steps"></div>
+  </section>
+
+  <h2>Libraries</h2>
+  <section class="panel" id="libraries"></section>
+
+  <h2>Storage</h2>
+  <section class="panel" id="storage"></section>
+
+  <footer id="foot"></footer>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (t) => String(t ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const gb = (b) => (b / 1e9).toFixed(2) + " GB";
+const post = (url, body) => fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: body ? JSON.stringify(body) : null}).then(refresh);
+
+function services(list) {
+  $("#services").innerHTML = list.map((s) => `
+    <div class="row"><span class="dot ${s.state}"></span><span class="name">${esc(s.title)}</span><span class="detail" title="${esc(s.detail)}">${esc(s.detail)}</span></div>`).join("");
+}
+
+function models(m) {
+  const rows = [];
+  for (const key of ["mmaudio", "vlm", "clap"]) {
+    const x = m[key]; if (!x) continue;
+    let bar = "";
+    if (!x.ready && x.total) {
+      const pct = Math.round(100 * x.completed / x.total);
+      bar = `<div class="bar"><i style="width:${pct}%"></i></div><div class="meta"><span>${gb(x.completed)} of ${gb(x.total)}</span><span>${pct}%</span></div>`;
+    }
+    rows.push(`<div class="step"><div class="head"><span class="dot ${x.ready ? "ok" : "starting"}"></span><span class="title">${esc(x.title)}</span><span class="detail">${esc(x.detail)}</span>${key === "vlm" && !x.ready && !x.total ? '<button onclick="post(\'/vlm/pull\')">Fetch</button>' : ""}</div>${bar}${x.error ? `<div class="err">${esc(x.error)}</div>` : ""}</div>`);
+  }
+  $("#models").innerHTML = rows.join("");
+}
+
+function steps(list, running) {
+  $("#steps").innerHTML = list.map((s) => {
+    const pct = s.total ? Math.min(100, Math.round(100 * s.done / s.total)) : 0;
+    const isRunning = s.status === "running";
+    const btn = isRunning ? `<button onclick="post('/jobs/${s.name}/pause')">Pause</button>`
+      : `<button onclick="post('/jobs/${s.name}/start')">${s.status === "paused" || s.status === "interrupted" || s.status === "partial" ? "Continue" : s.status === "complete" ? "Run again" : s.status === "error" ? "Retry" : "Start"}</button>`;
+    const label = {idle: "not started", running: "running", paused: "paused", interrupted: "interrupted", partial: "partly done", complete: "complete", done: "finished", error: "failed"}[s.status] || s.status;
+    return `<div class="step">
+      <div class="head"><span class="title">${esc(s.title)}</span><span class="state ${s.status}">${label}</span>${btn}</div>
+      <div class="about">${esc(s.about)}</div>
+      <div class="bar ${s.status === "complete" ? "done" : ""}"><i style="width:${pct}%"></i></div>
+      <div class="meta"><span>${esc(s.detail)}</span><span>${pct}%</span></div>
+      ${s.error ? `<div class="err">${esc(s.error)}</div>` : ""}
+      ${isRunning && s.log.length ? `<pre class="log">${esc(s.log.join("\n"))}</pre>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function libraries(list) {
+  if (!list.length) { $("#libraries").innerHTML = '<div class="row"><span class="detail">No library yet. The BBC archive comes from the steps above; your own sounds go into data/libraries/&lt;name&gt;/ and appear here.</span></div>'; return; }
+  $("#libraries").innerHTML = `<table><tr><th>Library</th><th class="num">Sounds</th><th class="num">Embedded</th><th class="num">On disk</th><th class="num">Audio index</th><th class="num">Hours</th></tr>` +
+    list.map((l) => `<tr><td>${esc(l.library)}</td><td class="num">${l.sounds.toLocaleString()}</td><td class="num">${l.embedded.toLocaleString()}</td><td class="num">${l.local_files.toLocaleString()}</td><td class="num">${l.segment_indexed.toLocaleString()}</td><td class="num">${l.hours}</td></tr>`).join("") + "</table>";
+}
+
+function storage(list) {
+  $("#storage").innerHTML = `<table><tr><th>What</th><th>Where</th><th class="num">Size</th></tr>` +
+    (list || []).map((s) => `<tr><td>${esc(s.title)}</td><td class="detail" style="white-space:normal">${esc(s.where)}</td><td class="num">${s.bytes == null ? "" : gb(s.bytes)}</td></tr>`).join("") +
+    `</table><p class="about">Docker volumes are listed in Docker Desktop under Volumes; they live in Docker's disk image (Settings &gt; Resources &gt; Advanced &gt; Disk image location). Folders are set in .env or by install.ps1.</p>`;
+}
+
+async function refresh() {
+  try {
+    const d = await (await fetch("/status")).json();
+    services(d.services); models(d.models); steps(d.steps, d.running); libraries(d.libraries); storage(d.storage);
+    const sx = d.search || {};
+    $("#search-summary").innerHTML = sx.sounds ? `<span class="detail">${sx.sounds.toLocaleString()} sounds searchable by video or prompt; search by sound ${sx.by_sound ? "on the " + sx.index + " index" : "not ready yet"}</span>`
+      : '<span class="detail">The search service is not up yet.</span>';
+    $("#pipeline-state").textContent = d.external_indexer ? "an indexer started from the command line is running: " + d.external_indexer
+      : d.pipeline.active ? "running the steps in order; a step that was interrupted is continued" : "";
+    $("#pipeline-start").disabled = d.pipeline.active; $("#pipeline-stop").disabled = !d.pipeline.active;
+    if (d.pipeline.active) $("#download").checked = d.pipeline.download;
+    $("#foot").textContent = "Updated " + d.time + ". Closing this page changes nothing: the steps keep running in the setup container.";
+  } catch (e) {
+    $("#foot").textContent = "The setup service does not answer: " + e;
+  }
+}
+$("#pipeline-start").onclick = () => post("/pipeline/start", {download: $("#download").checked});
+$("#pipeline-stop").onclick = () => post("/pipeline/stop");
+refresh(); setInterval(refresh, 2500);
+</script>
+</body>
+</html>

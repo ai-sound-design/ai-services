@@ -1119,10 +1119,6 @@ async def generate_audio(
             clip_frames = clip_frames.to(target_dtype)
             sync_frames = sync_frames.to(target_dtype)
         
-        # Update sequence configuration (from demo.py)
-        seq_cfg.duration = duration
-        net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
-        
         # Setup generation exactly like demo.py; a negative seed means "pick one"
         if seed < 0:
             seed = random.randint(0, 2**31 - 1)
@@ -1143,6 +1139,13 @@ async def generate_audio(
             logger.info(f"🔒 GPU lock acquired (pending: {pending_requests}, active: {active_requests})")
             
             try:
+                # The sequence lengths live in the shared network, so they are set
+                # here, under the lock, right before the call that relies on them. Set
+                # earlier, a second request with another duration changed them while
+                # the first one was still generating ("clip_f.shape ... _clip_seq_len").
+                seq_cfg.duration = duration
+                net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
+
                 # Generate audio with no_grad (like demo.py)
                 # Note: generate() function returns audio-only by default (no video composite)
                 # In a worker thread: the model call takes many seconds and would otherwise

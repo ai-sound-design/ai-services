@@ -19,6 +19,7 @@ Nothing here touches the model; the search service holds CLAP and the index.
 """
 from __future__ import annotations
 
+import os
 import logging
 import subprocess
 from pathlib import Path
@@ -152,20 +153,55 @@ def write_piece(samples: np.ndarray, start: float, length: float, dst: Path) -> 
 
 # ── the search ───────────────────────────────────────────────────────────────
 
+# How many recordings the description search proposes before the search by sound picks
+# the best stretch among them. The search by sound alone compares the event's words with
+# the recordings' sound through CLAP, which hears rain in a roaring fire and a city
+# street in a train whistle; the descriptions say what a recording is. 0: off.
+CANDIDATES_BY_TEXT = int(os.environ.get("CANDIDATES_BY_TEXT", "20"))
+
+
+async def candidates_by_text(client: httpx.AsyncClient, search_url: str, text: str, library: Optional[str],
+                             limit: int) -> list[int]:
+    data = {"text": text, "limit": str(limit)}
+    if library:
+        data["library"] = library
+    response = await client.post(f"{search_url}/search/sounds", data=data)
+    if response.status_code != 200:
+        log.warning("description search: %s %s", response.status_code, response.text[:200])
+        return []
+    return [int(r["id"]) for r in response.json().get("results", []) if r.get("id") is not None]
+
+
 async def search_by_audio(client: httpx.AsyncClient, search_url: str, piece: Path, *, text: str,
                           text_weight: float, library: Optional[str], category: Optional[str],
                           limit: int) -> list[dict]:
-    data = {"text": text or "", "text_weight": str(text_weight), "limit": str(limit), "refine": "true"}
+    # Every candidate refined: a piece is cut at the offset, and an unrefined one is
+    # only the start of a 10 s window (often a pause), its score that of the window
+    data = {"text": text or "", "text_weight": str(text_weight), "limit": str(limit), "refine": "true",
+            "refine_top": str(limit)}
     if library:
         data["library"] = library
     if category:
         data["category"] = category
+    only: list[int] = []
+    if CANDIDATES_BY_TEXT > 0 and text:
+        only = await candidates_by_text(client, search_url, text, library, CANDIDATES_BY_TEXT)
+        if only:
+            data["only"] = ",".join(str(i) for i in only)
     with piece.open("rb") as handle:
         response = await client.post(f"{search_url}/search/by_audio",
                                      files={"audio": (piece.name, handle, "audio/wav")}, data=data)
     if response.status_code != 200:
         raise RuntimeError(f"search service: {response.status_code} {response.text[:300]}")
-    return response.json().get("results", [])
+    results = response.json().get("results", [])
+    if not results and only:
+        # none of the described recordings is in the sound index: the open search instead
+        data.pop("only", None)
+        with piece.open("rb") as handle:
+            response = await client.post(f"{search_url}/search/by_audio",
+                                         files={"audio": (piece.name, handle, "audio/wav")}, data=data)
+        results = response.json().get("results", []) if response.status_code == 200 else []
+    return results
 
 
 def choose_sequence(candidates: list[list[dict]], switch_penalty: float) -> list[dict]:

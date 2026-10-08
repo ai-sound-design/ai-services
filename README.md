@@ -16,6 +16,16 @@ used in the user study, where the spotting was operated Wizard-of-Oz style by
 the experimenters; in this backend the spotting service runs a vision-language
 model.
 
+## Demo
+
+The plugin's four modes running on this backend, recorded in Pro Tools:
+Spotting, Sound Recommendation, Sound Generation and Hybrid. All four videos,
+with what each mode does, are in the
+[plugin's README](https://github.com/ai-sound-design/ai-protools-aax#modes).
+The Hybrid run uses all four services together:
+
+https://github.com/user-attachments/assets/0d8f86b1-ce94-4fe8-9c39-b86115dfc923
+
 ## How it works
 
 ```
@@ -34,7 +44,7 @@ Pro Tools ── AAX plugin ── bundled Python scripts ──HTTP──▶ ge
 3. The plugin puts the result back into the session: the audio on its own
    track at the clip's position, the chosen sound from the list, one memory
    location per event, or one new track per generated sound, with the
-   library recordings that sound like it on a track underneath when asked.
+   library recordings found for it on a track underneath when asked.
 
 While a spotting or hybrid request runs, the plugin polls the service's
 progress endpoint (`/spot/progress/{job_id}`, `/hybrid/progress/{job_id}`)
@@ -56,9 +66,9 @@ The four kinds of service, one folder each:
 |--------|---------|------|--------------|
 | [`generation/`](generation/README.md) | `mmaudio-api` | 8000 | Video (or prompt) in, one window of audio out (4-12 s). [MMAudio](https://github.com/hkchengrex/MMAudio) as the reference model; `template/` for wrapping another one. |
 | [`generation/gateway/`](generation/gateway/README.md) | `generation-gateway` | 8010 | The same contract without a length limit: long requests in windows with crossfades, short ones padded, in front of the model service. The plugin and the hybrid service talk to this. |
-| [`search/`](search/README.md) | `sound-search-api` | 8002 | Video or prompt in, matching sounds out. X-CLIP embeddings over any indexed library: your own folders of sounds, the BBC Sound Effects Archive, or both. Also sound in, matching recordings out, located to the second: CLAP embeddings of 10 s windows of the files on disk. |
+| [`search/`](search/README.md) | `sound-search-api` | 8002 | Video or prompt in, matching sounds out. X-CLIP embeddings over any indexed library: your own folders of sounds, the BBC Sound Effects Archive, or both. Also sound in, matching recordings out, located to the second: CLAP embeddings of the files on disk, 2 s windows merged into segments where they sound alike. |
 | [`spotting/`](spotting/README.md) | `spotting-api` | 8003 | Video range in, sound events with timecodes out. A vision-language model describes the sounds a silent picture implies. |
-| [`hybrid/`](hybrid/README.md) | `hybrid-api` | 8004 | Video range in, one generated sound per sound event out, each with its own start and end; on request also library recordings that sound like each one, stitched from pieces. The reference implementation composes the services above. |
+| [`hybrid/`](hybrid/README.md) | `hybrid-api` | 8004 | Video range in, one generated sound per sound event out, each with its own start and end; on request also library recordings for each one: the event's description proposes candidates, the generated sound picks among them and the stretch inside each, stitched from pieces. The reference implementation composes the services above. |
 
 Behind them: `postgres` (the sound index, pgvector), `ollama` (hosts the
 vision-language model; optional, see below) and `indexer` (one-shot jobs that
@@ -83,13 +93,84 @@ twice.
   docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
   ```
 
-- Roughly 30 GB of free disk space for images and model weights, more if you
-  download the BBC archive (about 10 GB as mp3).
+- Roughly 80 GB of free disk space: the images (about 47 GB, most of it the
+  PyTorch base they share), the model weights (MMAudio 6 GB, the search models
+  8 GB, the vision-language model 6 GB) and the sound index (10 GB with the BBC
+  archive). A downloaded BBC archive takes another 60 GB as mp3.
 - On Windows, enough memory for the Docker VM: MMAudio needs about 10 GB while
   loading. Put `memory=24GB` under `[wsl2]` in `%UserProfile%\.wslconfig` and
   run `wsl --shutdown` once.
 
-### First start
+### Windows: install.ps1
+
+On Windows one script does the first start and opens the setup page:
+
+```powershell
+git clone https://github.com/ai-sound-design/ai-services.git
+cd ai-services
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+It checks the requirements above (the NVIDIA driver, Docker Desktop with the WSL 2
+engine, the GPU inside a container, the VM's memory in `.wslconfig`, free disk
+space), creates `.env`, builds the images, starts the services and opens
+`http://localhost:8020`. It installs neither Docker Desktop nor the driver: when
+one is missing it stops with the link to its installer, and is simply run again
+afterwards. Every step only does what is still missing, so it can be run any time.
+
+On the first run it creates `.env` from `.env.example` with a random database
+password and asks for the data folder (fetched audio and your libraries; default
+`.\data`, worth a bigger drive for the 60 GB of the BBC archive). It also asks
+for three optional folders: an existing copy of the BBC Sound Effects archive (a
+folder of `<id>.wav` or `.mp3` files), which is then registered instead of
+downloaded; a folder of your own sounds, which becomes a library of the search
+(both only read); and a folder for the models, if they should be visible as
+files rather than live in Docker volumes (see below). All of them can be given
+as parameters (`-DataDir "D:\AI Sound Design" -BbcArchive "D:\BBC" -OwnSounds
+"D:\Sounds" -ModelsDir "D:\Models"`, or `-NoPrompt` for the defaults) and end up
+as the `.env` entries `AUDIO_HOST_DIR`, `LIBRARIES_HOST_DIR`,
+`BBC_ARCHIVE_HOST_DIR`, `OWN_SOUNDS_HOST_DIR`, `OWN_SOUNDS_NAME`, `MODELS_STORE`
+and `OLLAMA_MODELS_STORE`. The script never edits `docker-compose.yml`.
+
+### The setup page
+
+`http://localhost:8020` (service `setup`) shows the state of the stack: every
+service and whether its model is loaded, the download of the MMAudio weights
+and the vision-language model with progress, and the steps that fill the sound
+index: the BBC metadata, the text embeddings, the BBC audio files (registered
+from an existing archive folder, or downloaded), the audio index, and every
+folder under `data/libraries`. *Set everything up* runs the
+steps in order; each can be paused and resumed and carries on where it stopped,
+also after a restart of the machine, since the steps only ever process what is
+still missing. The steps are the indexer's scripts below, so the command line
+does the same.
+
+### Where things are stored
+
+- **The data folder** (`.\data` unless `install.ps1` or `.env` say otherwise):
+  fetched or downloaded audio (`AUDIO_HOST_DIR`) and your libraries
+  (`LIBRARIES_HOST_DIR`). Plain folders, visible in Explorer, on whichever drive
+  has the room.
+- **The models** live in two named Docker volumes: `models` (MMAudio's weights
+  and the search models, about 15 GB) and `ollama-models` (the vision-language
+  model, about 6 GB). Docker Desktop lists them under *Volumes* with their
+  sizes, and the setup page shows them too. A volume sits in Docker's own disk,
+  where a 6 GB model loads in seconds; a Windows folder would be read through
+  Docker Desktop's file sharing and take minutes per load. Anyone who wants the
+  files visible anyway sets `MODELS_STORE` and `OLLAMA_MODELS_STORE` in `.env`
+  to folders (or runs `install.ps1 -ModelsDir`), and the installer copies what
+  is already there into the folders, or back into the volumes when the entries
+  are removed again.
+- **The database** (the sound index, 10 GB with the BBC archive), the setup
+  page's logs and the hybrid service's output are named volumes as well
+  (`postgres-data`, `setup-logs`, `hybrid-output`): PostgreSQL refuses a Windows
+  folder as its data directory and would be far slower on one. On Windows all
+  of Docker's data, volumes and images, lives in one virtual disk, by default
+  under `%LocalAppData%\Docker\wsl`; to move it, use Docker Desktop >
+  Settings > Resources > Advanced > Disk image location. `install.ps1` prints
+  where it is and how much room that drive has.
+
+### First start by hand
 
 ```bash
 git clone https://github.com/ai-sound-design/ai-services.git
@@ -103,8 +184,8 @@ Every setting has a working default. To change one, copy `.env.example` to
 
 **The first start takes long.** It builds the images (which pulls the PyTorch
 base image and installs the models' dependencies) and then downloads what the
-models need: the MMAudio weights and encoders (roughly 10 GB) into named
-volumes, the vision-language model (about 6 GB) into the Ollama container.
+models need: the MMAudio weights and encoders (roughly 10 GB) and the vision-language
+model (about 6 GB) into the data folder.
 With a fast connection that is half an hour; with a slow one, considerably
 longer. Nothing is wrong while `docker compose ps` reports the services as
 `health: starting` and `docker compose logs -f` shows downloads progressing.
@@ -140,16 +221,20 @@ docker compose run --rm indexer python embed.py --library bbc
 ```
 
 For a machine without internet access, download the archive once
-(`sources/bbc/download.py`) and set `AUDIO_FETCH=local_only` in `.env`.
+(`sources/bbc/download.py`) and set `AUDIO_FETCH=local_only` in `.env`. An
+existing copy of the archive is registered instead, read-only:
+`BBC_ARCHIVE_HOST_DIR` in `.env` names the folder and
+`docker compose run --rm indexer python sources/bbc/register.py` points the
+rows at its files.
 
 The search **by sound**, which the plugin's *Use database sounds* relies on,
 needs the audio itself: after `download.py` (your own libraries are on disk
-anyway) build the audio windows. This takes hours for the whole BBC archive,
-can be interrupted and resumed, and the partial index is usable right away;
-`index_folder.py` does it for a folder library on its own.
+anyway) build the audio index. This takes hours for the whole BBC archive (about
+four on a laptop GPU), can be interrupted and resumed, and the partial index is
+usable right away; `index_folder.py` does it for a folder library on its own.
 
 ```bash
-docker compose run --rm indexer python embed_audio.py
+docker compose run --rm indexer python embed_segments.py
 ```
 
 ### Stop, update, remove
@@ -157,11 +242,11 @@ docker compose run --rm indexer python embed_audio.py
 ```bash
 docker compose down                     # stop; volumes and ./data stay
 git pull && docker compose up -d --build   # update to a newer version
-docker compose down -v                  # remove the containers and the volumes (weights, index)
+docker compose down -v                  # remove the containers and the volume of the database (the index)
 ```
 
-`./data/` (fetched audio, your libraries, the Ollama store) is never touched
-by Compose; delete it yourself if you want it gone. On Linux the files Docker
+`./data/` (fetched audio, your libraries, the models) is never touched by
+Compose; delete it yourself if you want it gone. On Linux the files Docker
 writes there belong to root, so that takes `sudo`.
 
 ## The vision-language model: bundled or your own
@@ -171,7 +256,7 @@ ways to provide it:
 
 1. **Bundled (default).** The `ollama` container is part of the stack and pulls
    `gemma4:e4b-it-qat` on first start. If Ollama is already installed on the
-   host, point `OLLAMA_MODELS_HOST_DIR` at its store (`C:/Users/<you>/.ollama`,
+   host, point `OLLAMA_MODELS_STORE` at its store (`C:/Users/<you>/.ollama`,
    `~/.ollama`) and nothing is downloaded twice.
 2. **Your own server.** Set `BUNDLED_OLLAMA=0` in `.env`; the container is then
    left out and `spotting-api` talks to `VLM_URL` instead:
@@ -208,6 +293,8 @@ All settings are environment variables, listed with comments in
 | `AUDIO_FETCH` | `on_demand` | `local_only` restricts the search to sounds already on disk |
 | `AUDIO_HOST_DIR` | `./data/audio` | Fetched and downloaded audio, one subfolder per library |
 | `LIBRARIES_HOST_DIR` | `./data/libraries` | Your own sound libraries, one subfolder each |
+| `BBC_ARCHIVE_HOST_DIR` | `./data/archive` | An existing copy of the BBC archive, mounted read-only; `register.py` or the setup page point the rows at its files |
+| `OWN_SOUNDS_HOST_DIR`, `OWN_SOUNDS_NAME` | none, `own` | A folder of your own sounds, mounted read-only as the library `OWN_SOUNDS_NAME` |
 | `MMAUDIO_MODEL` | `large_44k_v2` | Which MMAudio variant to serve |
 | `CLAP_MODEL` | `laion/clap-htsat-fused` | Audio encoder for the search by sound; `embed_audio.py` and the API must agree |
 | `GATEWAY_MAX_SECONDS`, `GATEWAY_OVERLAP_SECONDS` | `600`, `1.0` | The longest sound the generation gateway makes, and the overlap between its crossfaded windows |

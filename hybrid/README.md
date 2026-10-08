@@ -31,7 +31,10 @@ produce, relative to the start of the sent video:
   "start_seconds": 1.2, "end_seconds": 3.0}]
 ```
 
-Without it the backend decides what the events are.
+Without it the backend decides what the events are. Foley and sound-effect events
+the plugin sends are split at the picture cuts inside the clip (asked from the
+spotting service's `/cuts`), the way spotted events are; ambience, music and
+dialogue carry on across cuts.
 
 `/hybrid` answers:
 
@@ -59,7 +62,12 @@ where its spectrum changes and the cut improves the match, up to
 `pieces_per_10s` pieces per ten seconds, none shorter than
 `min_piece_seconds`; a recording that fits the whole sound stays whole. Pieces
 under `min_similarity` are left out, so a sound without a convincing match
-keeps only its generated version. `start_seconds` of a piece is relative to
+keeps only its generated version. The recordings come from two searches: the
+description search proposes `HYBRID_CANDIDATES_BY_TEXT` recordings for the
+event's words (rain recordings for "rain on wet pavement"), and the search by
+sound picks the best stretch among them for the generated sound; alone, the
+search by sound compares the words with the recordings' sound through CLAP,
+which hears rain in a roaring fire. `start_seconds` of a piece is relative to
 the generated sound:
 
 ```json

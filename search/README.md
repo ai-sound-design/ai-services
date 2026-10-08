@@ -26,6 +26,21 @@ database sounds*). The audio has to be read for this, so only files on disk
 are indexed; the index is built with `embed_audio.py` and grows while it runs
 (HNSW), so a partial index is usable at once.
 
+The finer **adaptive index** (`sound_segments`, `sound_fine`) replaces the 10 s
+windows for the search by sound once it covers every file. `embed_segments.py`
+cuts each file into 2 s windows on a 1 s grid and merges consecutive windows
+that sound alike (cosine to the running mean above `SEGMENT_THRESHOLD`, 0.80)
+into one segment with the mean vector; pauses end a segment, and no segment
+exceeds 30 s. A run of miaows becomes one segment per miaow, a room tone a
+handful, so a one-second event is found by a vector of its own length instead
+of drowning in a 10 s window: on 343 BBC sounds a 1 s excerpt found its
+recording first 77 % of the time against 57 % with the windows, with 18 % more
+rows (halfvec halves them). The 2 s windows themselves are kept per sound,
+unindexed, so `refine` picks the best window without running CLAP over the
+file again and only scores the stretches inside it. `AUDIO_INDEX` chooses:
+`auto` (the default) uses the segments once every sound with windows has them,
+`segments` or `windows` force one; a request's `index` field overrides it.
+
 ## Libraries
 
 Every row belongs to a library, named in the `library` column. Two kinds:
@@ -71,8 +86,10 @@ the files is the larger part. It can be interrupted and resumed, and
 `index_folder.py` runs it for a folder library on its own.
 
 ```bash
-docker compose run --rm indexer python embed_audio.py                  # every local file
+docker compose run --rm indexer python embed_audio.py                  # the 10 s windows (older index)
 docker compose run --rm indexer python embed_audio.py --limit 500      # a first look
+docker compose run --rm indexer python embed_segments.py               # the adaptive index, same options
+docker compose run --rm indexer python embed_segments.py --ids 8025    # a few sounds ahead of the rest
 ```
 
 **Another archive.** Copy `sources/bbc/` as a pattern: a script that turns the
@@ -90,7 +107,7 @@ archive's records into rows with `library`, `external_id`, `description`,
 | `GET /sounds/{id}` | Metadata of one sound. |
 | `GET /sounds/{id}/preview` | The audio, for listening before importing. |
 | `GET /sounds/{id}/download` | The audio, for importing into the session. |
-| `POST /search/by_audio` | Multipart form: `audio` (file), optional `text` and `text_weight` (share of the text in the query, default 0), `limit`, `library`, `category`, `refine` (default true: locate the best stretch of the query's length inside each matched window), `envelope_weight` (0..1, default 0.3: share of the loudness-envelope similarity in the refined score, so the match also moves like the query), `exclude` (sound ids). Answers `{"results": [{"id", "library", "description", "category", "duration_seconds", "offset_seconds", "length_seconds", "similarity"}, ...]}`; `offset_seconds` is where in the file the match lies. Needs the audio windows of `embed_audio.py`; `GET /health` reports `audio_search.available` and a `reason` when it is not. |
+| `POST /search/by_audio` | Multipart form: `audio` (file), optional `text` and `text_weight` (share of the text in the query, default 0), `limit`, `library`, `category`, `refine` (default true: locate the best stretch of the query's length inside each matched segment or window), `refine_top` (how many results get it; default `REFINE_TOP`, 0: all), `index` (`segments` or `windows`, overrides `AUDIO_INDEX`), `envelope_weight` (0..1, default 0.3: share of the loudness-envelope similarity in the refined score, so the match also moves like the query), `exclude` (sound ids). Answers `{"results": [{"id", "library", "description", "category", "duration_seconds", "offset_seconds", "length_seconds", "similarity"}, ...]}`; `offset_seconds` is where in the file the match lies. Needs the audio index of `embed_segments.py` (or the 10 s windows of `embed_audio.py`); `GET /health` reports `audio_search.available` and a `reason` when it is not. |
 | `GET /sounds/{id}/snippet?start=&length=&channels=` | `length` seconds of the sound from `start`, as 48 kHz WAV with short fades: what a match points at, ready to place. `channels` 1 or 2 forces a channel count (pieces of different recordings on one track need the same). |
 
 The plugin's search profile can name the library to search, so one profile
@@ -118,4 +135,7 @@ Without a `library` field the search covers every library.
 | `LIBRARIES_HOST_DIR` | `./data/libraries` | Your own libraries, one subfolder each, mounted read-only |
 | `XCLIP_MODEL` | `microsoft/xclip-base-patch32-16-frames` | Query encoder; must match the embedding column (base 512, large 768) |
 | `CLAP_MODEL` | `laion/clap-htsat-fused` | Audio encoder for the search by sound; the API and `embed_audio.py` must use the same |
+| `AUDIO_INDEX` | `auto` | Which audio index the search by sound uses: `segments`, `windows`, or `auto` (the segments once they cover every sound) |
+| `SEGMENT_THRESHOLD` | `0.80` | `embed_segments.py`: a window joins the running segment while its cosine to the segment's mean stays above this |
+| `REFINE_TOP` | `0` | Results that get the fine search (0: all of them) |
 | `BBC_AUDIO_FORMAT` | `mp3` | Format `sources/bbc/download.py` fetches |
