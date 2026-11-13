@@ -331,4 +331,4 @@ Third-party components are **not** covered by it and keep their own terms:
 
 ## Author
 
-Anonymized for peer review.
+[Christoph J. Weber](https://github.com/chris-j-weber)
