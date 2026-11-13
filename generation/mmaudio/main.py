@@ -38,6 +38,10 @@ from config import (
 import torch
 import numpy as np
 import av
+
+# BigVGAN's long 1-D convolutions on the Apple GPU (no effect on CUDA or the CPU)
+import mps_compat
+mps_compat.install()
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware

@@ -36,6 +36,7 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
 from common import audio, db
+from common.device import torch_device
 from utils.db_client import DatabaseClient
 from utils.xclip_encoder import XCLIPEncoder
 
@@ -47,7 +48,7 @@ MODEL_NAME = os.getenv("XCLIP_MODEL", "microsoft/xclip-base-patch32-16-frames")
 AUDIO_FETCH = os.getenv("AUDIO_FETCH", "on_demand").strip().lower()      # on_demand | local_only
 AUDIO_DIR = db.AUDIO_DIR
 FETCH_USER_AGENT = "ai-sound-services-search"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = torch_device()
 
 encoder: Optional[XCLIPEncoder] = None
 clap: Optional[audio.ClapEncoder] = None
@@ -117,15 +118,17 @@ async def health_check():
                                              "audio_indexed": s.get("audio_indexed", 0)} for s in stats["libraries"]},
                 "available_sounds": stats["sounds_with_embeddings"],
                 "sounds_with_embeddings": stats["sounds_with_embeddings"],
-                # Search by sound: needs the CLAP model and at least one embedded window.
-                "audio_search": {"available": clap is not None and windows["windows"] > 0,
+                # Search by sound: needs the CLAP model and an audio index, either one: the
+                # setup page builds only the segments (embed_segments.py), the older windows
+                # come from embed_audio.py. The hybrid service reports this as database_match.
+                "audio_search": {"available": clap is not None and (windows["windows"] > 0 or segments["segments"] > 0),
                                  "model": clap.model_name if clap else None,
                                  "windows": windows["windows"], "sounds": windows["sounds"],
                                  "index": "segments" if _use_segments() else "windows",
                                  "segments": segments["segments"], "segmented_sounds": segments["sounds"],
-                                 "reason": None if clap is None or windows["windows"] > 0 else
-                                           "no audio windows yet: run embed_audio.py"
-                                           if clap is not None else "CLAP model not loaded"}}
+                                 "reason": "CLAP model not loaded" if clap is None else
+                                           None if windows["windows"] > 0 or segments["segments"] > 0 else
+                                           "no audio index yet: the setup page's 'Audio index' step builds it"}}
     except Exception as exc:
         logger.error("Health check failed: %s", exc)
         raise HTTPException(status_code=503, detail="Service unhealthy")

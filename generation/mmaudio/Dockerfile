@@ -40,6 +40,7 @@ RUN pip install -r /tmp/requirements.txt
 COPY shared /app/shared
 COPY generation/mmaudio/main.py /app/api/main.py
 COPY generation/mmaudio/prefetch.py /app/api/prefetch.py
+COPY generation/mmaudio/mps_compat.py /app/api/mps_compat.py
 COPY generation/mmaudio/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i "s/\r$//" /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 

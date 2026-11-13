@@ -14,6 +14,13 @@ the machine, picks up at the step that was interrupted.
 Environment (all with the stack's defaults):
     DATABASE_URL, AUDIO_DIR, LIBRARIES_DIR, BBC_AUDIO_FORMAT, VLM_URL, VLM_MODEL, VLM_API
     SETUP_LOG_DIR     where the steps' output goes (default /data/setup/logs)
+    MMAUDIO_URL, GENERATION_URL, SEARCH_URL, SPOTTING_URL, HYBRID_URL
+                      the services' addresses (default: their compose names)
+    MODELS_DIR, OLLAMA_MODELS_DIR
+                      where the models are mounted (default /models, /models-ollama)
+
+Outside Docker (install_mac.sh runs the services natively on a Mac) these point at
+localhost and at host folders; the steps run with the Python running this page.
 """
 from __future__ import annotations
 
@@ -23,6 +30,7 @@ import logging
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -47,23 +55,28 @@ MODELS_STORE = os.getenv("MODELS_STORE", "models")
 OLLAMA_MODELS_STORE = os.getenv("OLLAMA_MODELS_STORE", "ollama-models")
 AUDIO_HOST_DIR = os.getenv("AUDIO_HOST_DIR", "./data/audio")
 LIBRARIES_HOST_DIR = os.getenv("LIBRARIES_HOST_DIR", "./data/libraries")
-MODELS_DIR = Path("/models")
-OLLAMA_DIR = Path("/models-ollama")
+MODELS_DIR = Path(os.getenv("MODELS_DIR", "/models"))
+OLLAMA_DIR = Path(os.getenv("OLLAMA_MODELS_DIR", "/models-ollama"))
 VLM_MODEL = os.getenv("VLM_MODEL", "gemma4:e4b-it-qat")
 VLM_API = os.getenv("VLM_API", "ollama").strip().lower()
 BBC_FORMAT = os.getenv("BBC_AUDIO_FORMAT", "mp3")
 BBC_EXPECTED = 33_000                      # records in the archive, for the bar before the harvest is done
 LOG_DIR = Path(os.getenv("SETUP_LOG_DIR", "/data/setup/logs"))
-DOCKER_SOCKET = Path("/var/run/docker.sock")
+DOCKER_SOCKET = Path(os.getenv("DOCKER_SOCKET", "/var/run/docker.sock"))
+DATABASE_STORE = os.getenv("DATABASE_STORE", "postgres-data")      # a volume name, or a folder outside Docker
+# The indexer's scripts sit beside this file (/app in the image). Not resolved: outside
+# Docker the file is a link in a folder laid out like the image, the scripts beside it.
+APP_DIR = Path(__file__).parent
 AUDIO_SUFFIXES = {".wav", ".aif", ".aiff", ".flac", ".mp3", ".ogg", ".m4a", ".caf"}
 
 # The services, as the page lists them: title, compose service, health URL
 SERVICES = [
-    ("Generation (MMAudio)", "mmaudio-api", "http://mmaudio-api:8000/health"),
-    ("Generation gateway", "generation-gateway", "http://generation-gateway:8010/health"),
-    ("Sound search", "sound-search-api", "http://sound-search-api:8002/health"),
-    ("Spotting", "spotting-api", "http://spotting-api:8003/health"),
-    ("Hybrid", "hybrid-api", "http://hybrid-api:8004/health"),
+    ("Generation (MMAudio)", "mmaudio-api", os.getenv("MMAUDIO_URL", "http://mmaudio-api:8000").rstrip("/") + "/health"),
+    ("Generation gateway", "generation-gateway",
+     os.getenv("GENERATION_URL", "http://generation-gateway:8010").rstrip("/") + "/health"),
+    ("Sound search", "sound-search-api", os.getenv("SEARCH_URL", "http://sound-search-api:8002").rstrip("/") + "/health"),
+    ("Spotting", "spotting-api", os.getenv("SPOTTING_URL", "http://spotting-api:8003").rstrip("/") + "/health"),
+    ("Hybrid", "hybrid-api", os.getenv("HYBRID_URL", "http://hybrid-api:8004").rstrip("/") + "/health"),
     ("Ollama (hosts the vision-language model)", "ollama", f"{OLLAMA_URL}/api/tags"),
 ]
 
@@ -72,23 +85,23 @@ STEPS: dict[str, dict[str, Any]] = {
     "bbc_metadata": {"title": "BBC Sound Effects: metadata",
                      "about": "The archive's records (about 33,000), so it can be searched by video or prompt; "
                               "no audio is downloaded. Free for research use under the BBC's terms.",
-                     "command": ["python", "sources/bbc/harvest.py"]},
+                     "command": [sys.executable, "sources/bbc/harvest.py"]},
     "text_embeddings": {"title": "Text embeddings",
                         "about": "One vector per description, for the search by video or prompt.",
-                        "command": ["python", "embed.py"]},
+                        "command": [sys.executable, "embed.py"]},
     "bbc_archive": {"title": "BBC Sound Effects: existing archive",
                     "about": "The copy of the archive in the folder given at installation (BBC_ARCHIVE_HOST_DIR), read "
                              "only: its files are registered as the sounds' audio, nothing is downloaded or copied.",
-                    "command": ["python", "sources/bbc/register.py"]},
+                    "command": [sys.executable, "sources/bbc/register.py"]},
     "bbc_audio": {"title": f"BBC Sound Effects: download the audio files ({BBC_FORMAT})",
                   "about": "Optional. The archive on disk (about 60 GB as mp3). Not required for searching, since a "
                            "sound is fetched the first time it is used, but needed for the audio index below; an "
                            "existing archive folder makes this step unnecessary.",
-                  "command": ["python", "sources/bbc/download.py", "--format", BBC_FORMAT]},
+                  "command": [sys.executable, "sources/bbc/download.py", "--format", BBC_FORMAT]},
     "audio_index": {"title": "Audio index",
                     "about": "CLAP vectors of every file on disk, for the search by sound and the Hybrid mode's "
                              "library pieces. Hours for the whole archive; the partial index is used right away.",
-                    "command": ["python", "embed_segments.py"]},
+                    "command": [sys.executable, "embed_segments.py"]},
 }
 PIPELINE = ["bbc_metadata", "text_embeddings", "bbc_archive", "bbc_audio", "audio_index"]
 ARCHIVE_DIR = Path(os.getenv("BBC_ARCHIVE_DIR", "/data/archive"))
@@ -193,7 +206,7 @@ class Runner:
         if name.startswith("folder:"):
             library = name.split(":", 1)[1]
             path = _disk_cache.get("paths", {}).get(library)
-            return ["python", "index_folder.py", library] + (["--path", path] if path else [])
+            return [sys.executable, "index_folder.py", library] + (["--path", path] if path else [])
         raise HTTPException(404, f"no such step: {name}")
 
     def start(self, name: str) -> None:
@@ -204,7 +217,7 @@ class Runner:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
             handle = open(LOG_DIR / f"{name}.log", "ab")
             handle.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')}  {' '.join(command)}\n".encode())
-            self.procs[name] = subprocess.Popen(command, cwd="/app", stdout=handle, stderr=subprocess.STDOUT)
+            self.procs[name] = subprocess.Popen(command, cwd=APP_DIR, stdout=handle, stderr=subprocess.STDOUT)
             store.set_job(name, "running")
             log.info("started %s: %s", name, " ".join(command))
 
@@ -396,7 +409,7 @@ def storage(project: str) -> list[dict]:
     rows = [
         {"title": "MMAudio and search models", "where": where(MODELS_STORE, project), "bytes": _disk_cache.get("models_bytes")},
         {"title": "Vision-language model", "where": where(OLLAMA_MODELS_STORE, project), "bytes": _disk_cache.get("ollama_bytes")},
-        {"title": "Sound index (database)", "where": where("postgres-data", project), "bytes": None},
+        {"title": "Sound index (database)", "where": where(DATABASE_STORE, project), "bytes": None},
         {"title": "Audio (fetched and downloaded)", "where": f"folder {AUDIO_HOST_DIR}", "bytes": _disk_cache.get("audio_bytes")},
         {"title": "Libraries", "where": f"folder {LIBRARIES_HOST_DIR}", "bytes": _disk_cache.get("libraries_bytes")},
     ]

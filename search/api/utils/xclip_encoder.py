@@ -26,7 +26,7 @@ class XCLIPEncoder:
         
         Args:
             model_name: Hugging Face model name
-            device: Device to run on ('cuda' or 'cpu')
+            device: Device to run on ('cuda', 'mps' or 'cpu')
         """
         self.device = device
         self.model_name = model_name
@@ -44,12 +44,15 @@ class XCLIPEncoder:
             logger.info("✓ Half precision (FP16) enabled")
         
         # Compile model for faster inference (PyTorch 2.0+)
-        # Reduces overhead and optimizes graph execution
-        try:
-            self.model = torch.compile(self.model, mode="reduce-overhead")
-            logger.info("✓ torch.compile enabled (reduce-overhead mode)")
-        except Exception as e:
-            logger.warning(f"torch.compile not available: {e}")
+        # Reduces overhead and optimizes graph execution. CUDA only: "reduce-overhead"
+        # means CUDA graphs, and on the Apple GPU a compile error would only surface
+        # at the first query, not here.
+        if device == "cuda":
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                logger.info("✓ torch.compile enabled (reduce-overhead mode)")
+            except Exception as e:
+                logger.warning(f"torch.compile not available: {e}")
         
         logger.info(f"✓ X-CLIP loaded on {device}")
         

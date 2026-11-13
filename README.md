@@ -7,7 +7,8 @@ clip, recommending sounds from a searchable library, spotting sound events as
 memory locations, and a hybrid of the two that returns one generated sound per
 sound event. It does none of that itself; it sends the work to HTTP services. This repository is one complete set of such services, packaged
 so that a single `docker compose up` brings it up on a machine with an NVIDIA
-GPU. It is also the reference for writing your own: every service folder
+GPU, and `install_mac.sh` runs the same services natively on an Apple Silicon
+Mac. It is also the reference for writing your own: every service folder
 documents the contract the plugin relies on, and a service that fulfils it can
 replace the one here without a change to the plugin.
 
@@ -84,7 +85,8 @@ twice.
 ### Requirements
 
 - Docker with Compose v2: Docker Engine on Linux, Docker Desktop on Windows.
-  (macOS has no NVIDIA GPU passthrough, so the stack cannot run there.)
+  (On a Mac, Docker cannot reach the GPU; see [macOS](#macos-install_macsh)
+  below, which runs the services without Docker.)
 - An NVIDIA GPU with current drivers and the NVIDIA Container Toolkit. On
   Windows this comes with Docker Desktop and WSL2; on Linux install the toolkit
   from NVIDIA and restart Docker. Check that a container sees the GPU:
@@ -131,6 +133,102 @@ as parameters (`-DataDir "D:\AI Sound Design" -BbcArchive "D:\BBC" -OwnSounds
 as the `.env` entries `AUDIO_HOST_DIR`, `LIBRARIES_HOST_DIR`,
 `BBC_ARCHIVE_HOST_DIR`, `OWN_SOUNDS_HOST_DIR`, `OWN_SOUNDS_NAME`, `MODELS_STORE`
 and `OLLAMA_MODELS_STORE`. The script never edits `docker-compose.yml`.
+
+### macOS: install_mac.sh
+
+On an Apple Silicon Mac (M1 or later, macOS 14 or newer, 32 GB of memory
+recommended) the services run natively instead of in Docker: Docker on macOS
+cannot reach the Apple GPU, so the models would run on the CPU inside its VM.
+Each service runs in a Python virtualenv of its own with the versions its
+Dockerfile installs, from the same source files, on the same ports, configured
+by the same `.env`; MMAudio, the search and the indexer run on the Apple GPU
+(MPS), the vision-language model in a native Ollama, the sound index in a
+Homebrew PostgreSQL 17 with pgvector. The plugin and the setup page see no
+difference. The installer also sets up the
+[web UI](https://github.com/ai-sound-design/ai-sound-webui), the plugin's four
+modes in the browser without Pro Tools, on http://localhost:8030.
+
+**Without Terminal: the installer app.** Download
+`AI-Sound-Design-Installer-macOS.zip` from the newest release of
+[installer](https://github.com/ai-sound-design/installer/releases/latest),
+open it and double-click **AI Sound Design Installer**. Its window offers the
+backend services, the web UI, the Pro Tools plugin (the newest release of
+[ai-protools-aax](https://github.com/ai-sound-design/ai-protools-aax/releases)) and
+the sound database (the BBC index, optionally with all of its audio), each with
+a checkbox, the folders to use, and then the progress; macOS asks for the Mac's
+password when Homebrew or the plugin is installed. The app is not signed by
+Apple, so the first double-click ends in a message that macOS could not verify
+it: click *Done*, open *System Settings > Privacy & Security*, click **Open
+Anyway** and confirm with the Mac's password.
+
+The installer fetches this repository's `main` itself and remembers the commit
+it installed (`.mac/installed-from`); opened again, it compares what is installed
+with GitHub (this repository, the web UI, the plugin's releases, its own releases)
+and ticks what has an update. The sound database loads in the background: the
+window can be closed, the loading carries on after a restart, and the installer
+shows where it is.
+
+Afterwards the app **AI Sound Design** (in Applications, so in Launchpad and
+Spotlight; drag it into the Dock) opens the web UI, starting the services first
+when they were stopped. `~/AI Sound Design` holds the installation, the
+installer for later updates and the files **Web UI**, **Start backend**, **Stop
+backend**, **Backend status** and **Setup page** to double-click.
+
+**With Terminal:**
+
+```bash
+git clone https://github.com/ai-sound-design/ai-services.git "$HOME/AI Sound Design/ai-services"
+cd "$HOME/AI Sound Design/ai-services"
+bash install_mac.sh
+```
+
+The services must not run from Desktop, Documents, Downloads or iCloud Drive:
+macOS keeps background services out of them, and a service there hangs at its
+first file access. A copy in one of them (the downloaded ZIP) copies itself to
+`~/AI Sound Design/ai-services` and installs from there; an installation already
+there keeps its `.env`, its data and its environments. A checkout anywhere else
+runs in place.
+
+What is missing is installed: [Homebrew](https://brew.sh) with Apple's command
+line tools (about 1 GB, no Xcode; this needs an administrator account and asks
+for its password once), the Xcode licence accepted where a full Xcode was never
+opened, then ffmpeg, PostgreSQL 17, pgvector, Python 3.12, Ollama and Node.js
+(which only builds the web UI) with Homebrew. It creates `.env` as `install.ps1` does (a
+random database password; data folder, BBC archive, own sounds and models folder
+asked for or given as `--data-dir`, `--bbc-archive`, `--own-sounds`,
+`--models-dir`, `--sessions` for the web UI's Pro Tools sessions, `--no-prompt`), builds the virtualenvs and MMAudio's pinned
+source under `.mac/`, fetches the models (MMAudio 10 GB, the vision-language
+model 6 GB), starts every service, makes the app **AI Sound Design** that opens
+the web UI, and opens the web UI. Like `install.ps1`, it only does what is missing
+and can be run again at any time.
+
+The services run as launchd agents: they start at every login and are restarted
+when one exits. `mac/backend.py` manages them:
+
+```bash
+python3 mac/backend.py status                 # which answer, on which port
+python3 mac/backend.py logs mmaudio 100       # a service's log (.mac/logs/)
+python3 mac/backend.py restart search         # after an edit or a change in .env
+python3 mac/backend.py stop                   # all of them, until the next start or login
+python3 mac/backend.py start
+python3 mac/backend.py uninstall              # remove the agents and the app; data and .mac/ stay
+python3 mac/backend.py database [--audio]     # fill the sound index (the setup page's "Set everything up")
+```
+
+Where things are: the database in `<data folder>/postgres`, the models in
+`<data folder>/models` (or `MODELS_STORE`), the vision-language model in
+Ollama's `~/.ollama/models`, everything installed in `.mac/`. Some settings only
+matter on a Mac: `MAC_BIND_HOST` (default `127.0.0.1`, this Mac only; `0.0.0.0`
+makes the services reachable from the network, as Docker does) and
+`OLLAMA_PORT` (the Ollama this backend runs, default 11435, beside an Ollama of
+your own on 11434). The web UI: `WEBUI_SESSIONS_DIRS` (the folders with Pro
+Tools sessions it shows, several separated by `;`; not in Documents, Desktop or
+Downloads, which macOS keeps background services out of), `WEBUI_PORT` (8030),
+`MAC_WEBUI=0` to leave it out, `WEBUI_REF` for another branch or tag than
+`main`. MMAudio runs in `float32` there (`FORCE_DTYPE`, which the
+installer sets): the M1 and M2 have no native `bfloat16`, which made a sound
+about a quarter slower. On an M1 Ultra an 8 s sound from a prompt takes about
+9 s, a 20 s sound from a video about 80 s, spotting a 14 s clip about 100 s.
 
 ### The setup page
 
@@ -298,7 +396,7 @@ All settings are environment variables, listed with comments in
 | `MMAUDIO_MODEL` | `large_44k_v2` | Which MMAudio variant to serve |
 | `CLAP_MODEL` | `laion/clap-htsat-fused` | Audio encoder for the search by sound; `embed_audio.py` and the API must agree |
 | `GATEWAY_MAX_SECONDS`, `GATEWAY_OVERLAP_SECONDS` | `600`, `1.0` | The longest sound the generation gateway makes, and the overlap between its crossfaded windows |
-| `FORCE_DEVICE` | `auto` | Leave at `auto`. The stack needs an NVIDIA GPU; `cpu` exists in the code but is far too slow to be useful |
+| `FORCE_DEVICE` | `auto` | Leave at `auto`: CUDA with an NVIDIA GPU, the Apple GPU (`mps`) on a Mac; `cpu` exists in the code but is far too slow to be useful |
 
 ## Connecting the plugin
 

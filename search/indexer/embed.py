@@ -27,6 +27,7 @@ from psycopg2.extras import execute_batch
 from transformers import AutoModel, AutoTokenizer
 
 from common import db
+from common.device import torch_device
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s")
 log = logging.getLogger("embed")
@@ -53,7 +54,7 @@ def embed_missing(connection, model: str = "base", library: str | None = None,
                   batch_size: int = 64, rebuild: bool = False) -> int:
     """Embed every row lacking a vector (or all rows with rebuild). Returns the count."""
     spec = db.EMBEDDING_COLUMNS[model]
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch_device()
     if device == "cpu":
         log.warning("no GPU visible, embedding on the CPU (slower, still fine for a few thousand sounds)")
 

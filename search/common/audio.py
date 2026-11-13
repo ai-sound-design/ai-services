@@ -136,7 +136,9 @@ class ClapEncoder:
         import torch
         from transformers import ClapModel, ClapProcessor
 
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        from common.device import torch_device
+
+        self.device = device or torch_device()
         log.info("loading %s on %s", model_name, self.device)
         self.model_name = model_name
         self.processor = ClapProcessor.from_pretrained(model_name)

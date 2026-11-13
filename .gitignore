@@ -5,3 +5,6 @@ __pycache__/
 outputs/
 data/
 examples/videos/
+
+# Native macOS runtime (install_mac.sh): virtualenvs, MMAudio source, logs
+.mac/
