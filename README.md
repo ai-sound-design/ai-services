@@ -86,7 +86,9 @@ twice.
 
 - Docker with Compose v2: Docker Engine on Linux, Docker Desktop on Windows.
   (On a Mac, Docker cannot reach the GPU; see [macOS](#macos-install_macsh)
-  below, which runs the services without Docker.)
+  below, which runs the services without Docker. On Windows the same is
+  possible without Docker Desktop, see
+  [Windows without Docker](#windows-without-docker-install_windowsps1).)
 - An NVIDIA GPU with current drivers and the NVIDIA Container Toolkit. On
   Windows this comes with Docker Desktop and WSL2; on Linux install the toolkit
   from NVIDIA and restart Docker. Check that a container sees the GPU:
@@ -133,6 +135,87 @@ as parameters (`-DataDir "D:\AI Sound Design" -BbcArchive "D:\BBC" -OwnSounds
 as the `.env` entries `AUDIO_HOST_DIR`, `LIBRARIES_HOST_DIR`,
 `BBC_ARCHIVE_HOST_DIR`, `OWN_SOUNDS_HOST_DIR`, `OWN_SOUNDS_NAME`, `MODELS_STORE`
 and `OLLAMA_MODELS_STORE`. The script never edits `docker-compose.yml`.
+
+`-Ollama docker|host` says where the vision-language model for the spotting
+runs: in the stack's own Ollama container (the default), or in an Ollama
+installed on Windows (`host`: installed with winget when missing,
+`OLLAMA_HOST=0.0.0.0` set for the account so the containers reach it as
+`host.docker.internal`, the model pulled; `.env` then has `BUNDLED_OLLAMA=0`
+and `VLM_URL=http://host.docker.internal:11434`). `-NoBrowser` leaves the setup
+page closed at the end.
+
+**Without a terminal: the installer app.** Download
+`AI-Sound-Design-Installer-Windows.zip` from the newest release of
+[installer](https://github.com/ai-sound-design/installer/releases/latest),
+unpack it and double-click **AI Sound Design Installer.exe**. Its window offers
+the backend services (in Docker Desktop, or on the PC directly as below), the
+web UI, the Pro Tools plugin and the sound database, each with a checkbox, the
+Ollama choice above, the folders to use, and then the progress. It fetches this
+repository's `main` itself, runs `install.ps1` and remembers the commit it
+installed (`.windows\installed-from`); opened again, it offers what has an
+update. The app is not signed: the first time, Windows SmartScreen says it
+protected the PC; *More info* > *Run anyway*.
+
+### Windows without Docker: install_windows.ps1
+
+For a Windows PC without Docker Desktop (or without the virtualization it
+needs), the services run natively, as on a Mac: each in a Python virtualenv of
+its own with the versions its Dockerfile installs, from the same source files,
+on the same ports, configured by the same `.env`. PyTorch comes from its CUDA
+12.4 wheels, so MMAudio, the search and the indexer run on the NVIDIA GPU; the
+vision-language model runs in the Ollama for Windows; the sound index in
+PostgreSQL 17 (EDB's binaries, the server parts only) with pgvector built for
+it (pgvector publishes no Windows binaries; the installer's releases carry one
+built by GitHub). The plugin and the setup page see no difference. The web UI
+is set up as well, on http://localhost:8030.
+
+The installer app above offers this as *On this PC directly*. In a terminal:
+
+```powershell
+git clone https://github.com/ai-sound-design/ai-services.git "$env:UserProfile\AI Sound Design\ai-services"
+cd "$env:UserProfile\AI Sound Design\ai-services"
+powershell -ExecutionPolicy Bypass -File install_windows.ps1
+```
+
+What is missing is installed with winget: Python 3.12 (for this account),
+ffmpeg (Gyan's full build, with the drawtext filter the spotting burns frame
+times with), Node.js (which only builds the web UI; its installer asks for
+administrator rights) and Ollama (not when `.env` already points `VLM_URL` at
+another server, such as LM Studio or an Ollama elsewhere with `VLM_API=openai`).
+It creates `.env` as `install.ps1` does (the
+same parameters, plus `-Sessions` for the web UI's Pro Tools sessions,
+`-WebUI on|off` and `-Only webui`, which sets up only the web UI beside a Docker
+stack), fetches PostgreSQL and pgvector into `.windows\pgsql`, builds the
+virtualenvs and MMAudio's pinned source under `.windows\`, fetches the models
+(MMAudio 10 GB, the vision-language model 6 GB), starts every service and
+makes the shortcuts. Like `install.ps1`, it only does what is missing and can be
+run again at any time.
+
+The services run as background processes under a small supervisor that
+restarts one when it exits, started by a task of the account at every logon
+(*AI Sound Design backend* in the Task Scheduler). `windows\backend.py` manages
+them, with the same commands as the Mac's `mac/backend.py`:
+
+```powershell
+python windows\backend.py status                 # which answer, on which port
+python windows\backend.py logs mmaudio 100       # a service's log (.windows\logs\)
+python windows\backend.py restart search         # after an edit or a change in .env
+python windows\backend.py stop                   # all of them, until the next start or logon
+python windows\backend.py start
+python windows\backend.py uninstall              # stop everything, remove the logon task; data and .windows\ stay
+python windows\backend.py database [--audio]     # fill the sound index (the setup page's "Set everything up")
+```
+
+Next to the installation and in the Start menu: **Web UI**, **Setup page**,
+**Start backend**, **Stop backend** and **Backend status**. Where things are:
+the database in `<data folder>\postgres`, the models in `<data folder>\models`
+(or `MODELS_STORE`), the vision-language model in Ollama's
+`%UserProfile%\.ollama\models`, everything installed in `.windows\`. Settings
+that only matter here: `WINDOWS_BIND_HOST` (default `127.0.0.1`, this PC only;
+`0.0.0.0` makes the services reachable from the network, as Docker does),
+`WINDOWS_WEBUI=0` to leave the web UI out, `WEBUI_SESSIONS_DIRS`, `WEBUI_PORT`
+and `WEBUI_REF` as on a Mac. The Docker stack and the native services cannot
+run at the same time (the same ports): `docker compose stop` first.
 
 ### macOS: install_mac.sh
 

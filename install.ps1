@@ -16,13 +16,22 @@
 # Without the parameters the script asks for them when it runs in a console.
 # Everything it decides goes into .env; docker-compose.yml is never changed. On the
 # first run it also gives the database a random password in place of the example's.
+#
+# -Ollama docker|host: where the vision-language model runs. docker (the default of a
+# fresh .env) is the stack's own Ollama container; host is an Ollama installed on
+# Windows (installed with winget when missing, OLLAMA_HOST=0.0.0.0 set for this account
+# so the containers reach it as host.docker.internal), which then also serves other
+# programs on this PC. Without the parameter an existing choice in .env is kept.
+# -NoBrowser leaves the setup page closed at the end (the installer app opens it itself).
 
 param(
     [string]$DataDir = "",
     [string]$BbcArchive = "",
     [string]$OwnSounds = "",
     [string]$ModelsDir = "",
-    [switch]$NoPrompt
+    [ValidateSet("", "docker", "host")][string]$Ollama = "",
+    [switch]$NoPrompt,
+    [switch]$NoBrowser
 )
 
 $ErrorActionPreference = "Stop"
@@ -341,6 +350,65 @@ $drive = (Get-Item $root).PSDrive
 $free = [math]::Round((Get-PSDrive $drive.Name).Free / 1GB)
 if ($free -lt 90) { Warn "Only $free GB free on drive $($drive.Name): images, models and the index take about 80 GB, a downloaded BBC archive another 60 GB." } else { Ok "$free GB free on drive $($drive.Name):" }
 
+# Where the vision-language model runs: the stack's own Ollama container, or an Ollama
+# installed on Windows, which the containers reach as host.docker.internal.
+function Quote([string[]]$arguments) {
+    return (($arguments | ForEach-Object { if ($_ -eq "" -or $_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join " ")
+}
+function Native-Run($exe, [string[]]$arguments) {
+    # The program writes to the console (or the installer app's pipes) itself: through 2>&1 every
+    # stderr line would come wrapped in a PowerShell error record, and "Stop" would end the script
+    $line = Quote $arguments
+    if ($line) { $process = Start-Process -FilePath $exe -ArgumentList $line -NoNewWindow -Wait -PassThru }
+    else { $process = Start-Process -FilePath $exe -NoNewWindow -Wait -PassThru }
+    return $process.ExitCode
+}
+function Reachable($url) {
+    try { $null = Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 4; return $true } catch { return $false }
+}
+if ($Ollama -eq "host") {
+    Step "Vision-language model: the Ollama on this PC"
+    $exe = Join-Path $env:LocalAppData "Programs\Ollama\ollama.exe"
+    $found = Get-Command ollama -ErrorAction SilentlyContinue
+    if ($found) { $exe = $found.Source }
+    if (-not (Test-Path -LiteralPath $exe)) {
+        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { Fail "Ollama is not installed, and winget is missing to install it. Install Ollama for Windows, then run this again:" "https://ollama.com/download/windows" }
+        Warn "Ollama is not installed; installing it with winget (about 1 GB)"
+        $code = Native-Run "winget" @("install", "-e", "--id", "Ollama.Ollama", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
+        $exe = Join-Path $env:LocalAppData "Programs\Ollama\ollama.exe"
+        if ($code -ne 0 -or -not (Test-Path -LiteralPath $exe)) { Fail "Ollama could not be installed with winget. Install it by hand, then run this again:" "https://ollama.com/download/windows" }
+    }
+    Ok "Ollama: $exe"
+    # Ollama listens on localhost only unless OLLAMA_HOST says otherwise: a setting of
+    # this Windows account, read by the Ollama app when it starts
+    if ([Environment]::GetEnvironmentVariable("OLLAMA_HOST", "User") -ne "0.0.0.0") {
+        [Environment]::SetEnvironmentVariable("OLLAMA_HOST", "0.0.0.0", "User")
+        Ok "OLLAMA_HOST=0.0.0.0 set for this Windows account, so the containers can reach it"
+        Get-Process "ollama app", "ollama" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+    $env:OLLAMA_HOST = "0.0.0.0"
+    if (-not (Reachable "http://127.0.0.1:11434/api/version")) {
+        $app = Join-Path (Split-Path -Parent $exe) "ollama app.exe"
+        if (Test-Path -LiteralPath $app) { Start-Process -FilePath $app } else { Start-Process -FilePath $exe -ArgumentList "serve" -WindowStyle Hidden }
+        $deadline = (Get-Date).AddMinutes(1)
+        do { Start-Sleep -Seconds 2 } while (-not (Reachable "http://127.0.0.1:11434/api/version") -and (Get-Date) -lt $deadline)
+        if (-not (Reachable "http://127.0.0.1:11434/api/version")) { Fail "Ollama does not answer on http://127.0.0.1:11434. Start it from the Start menu, then run this again." }
+    }
+    Ok "Ollama answers on port 11434 (it starts with Windows)"
+    Ok "fetching the model $vlm if it is missing (about 6 GB the first time)"
+    if ((Native-Run $exe @("pull", $vlm)) -ne 0) { Fail "Ollama could not fetch $vlm; see the messages above." }
+    Set-EnvValue "BUNDLED_OLLAMA" "0"
+    Set-EnvValue "VLM_URL" "http://host.docker.internal:11434"
+    Set-EnvValue "VLM_API" "ollama"
+    Ok "the stack uses it: BUNDLED_OLLAMA=0, VLM_URL=http://host.docker.internal:11434"
+} elseif ($Ollama -eq "docker") {
+    Step "Vision-language model: Ollama in the stack"
+    Set-EnvValue "BUNDLED_OLLAMA" "1"
+    if ((Env-Value "VLM_URL") -match "host\.docker\.internal") { Set-EnvValue "VLM_URL" "http://ollama:11434"; Set-EnvValue "VLM_API" "ollama" }
+    Ok "the stack runs its own Ollama container (BUNDLED_OLLAMA=1); the model is fetched on the first start"
+}
+
 Step "Building the images (the first time pulls the PyTorch base image: several GB)"
 if ((Run "docker compose build") -ne 0) { Fail "The build failed; see the messages above." }
 
@@ -357,7 +425,17 @@ do {
     Start-Sleep -Seconds 3
     try { $null = Invoke-WebRequest -UseBasicParsing -Uri "${url}status" -TimeoutSec 4; $up = $true } catch { }
 } while (-not $up -and (Get-Date) -lt $deadline)
-if ($up) { Ok "$url"; Start-Process $url } else { Warn "The page does not answer yet; open $url in a minute." }
+if ($up) { Ok "$url"; if (-not $NoBrowser) { Start-Process $url } } else { Warn "The page does not answer yet; open $url in a minute." }
+if ((Env-Value "BUNDLED_OLLAMA") -eq "0" -and (Env-Value "VLM_URL") -match "host\.docker\.internal") {
+    # The host's Ollama from inside a container: Windows' firewall may stand in between
+    $seen = Docker-Capture @("run", "--rm", "alpine", "wget", "-qO-", "-T", "5", "http://host.docker.internal:11434/api/version")
+    if ($seen -match '"version"') { Ok "the containers reach the Ollama on this PC ($seen)" }
+    else {
+        Warn "The containers cannot reach the Ollama on this PC (http://host.docker.internal:11434), so the spotting"
+        Warn "will fail. Allow ollama.exe through the Windows firewall (Windows Security > Firewall & network"
+        Warn "protection > Allow an app through firewall), or run this again with -Ollama docker."
+    }
+}
 
 Write-Host ""
 Write-Host "The services fetch their models on this first start (MMAudio about 10 GB, the vision-language model about 6 GB);" -ForegroundColor Gray

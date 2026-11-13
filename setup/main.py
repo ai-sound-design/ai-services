@@ -576,7 +576,8 @@ async def job_log(name: str) -> dict:
 
 @app.post("/pipeline/start")
 async def pipeline_start(body: dict) -> dict:
-    store.set_state("pipeline", {"active": True, "download": bool(body.get("download", True))})
+    # "ran": the steps this run has started, each at most once (see supervise)
+    store.set_state("pipeline", {"active": True, "download": bool(body.get("download", True)), "ran": []})
     return {"ok": True}
 
 
@@ -604,12 +605,15 @@ async def supervise() -> None:
             pipeline = store.state("pipeline", {"active": False})
             if pipeline.get("active") and not runner.running():
                 steps = {s["name"]: s for s in progress(store.libraries())}
+                ran = pipeline.get("ran") or []
                 for name in pipeline_order(pipeline):
-                    # "done": the script ran through, even if a few items stay missing (files
-                    # the archive no longer serves); it is not started again and again
-                    if name not in steps or steps[name]["status"] in ("complete", "done", "error"):
+                    # Each step once per run: one that ran through with a few items left (files
+                    # the archive no longer serves, files ffmpeg cannot read) shows as "partial"
+                    # and must not be started again and again
+                    if name in ran or name not in steps or steps[name]["status"] in ("complete", "done", "error"):
                         continue
                     runner.start(name)
+                    store.set_state("pipeline", {**pipeline, "ran": ran + [name]})
                     break
                 else:
                     store.set_state("pipeline", {**pipeline, "active": False})
@@ -622,5 +626,10 @@ async def supervise() -> None:
 @app.on_event("startup")
 async def startup() -> None:
     await asyncio.to_thread(store.connect)
+    pipeline = await asyncio.to_thread(store.state, "pipeline")
+    if pipeline and pipeline.get("ran"):
+        # After a restart every step of a running pipeline gets one more go: the one that
+        # was interrupted carries on where it stopped
+        await asyncio.to_thread(store.set_state, "pipeline", {**pipeline, "ran": []})
     asyncio.create_task(supervise())
     log.info("setup page ready on port 8020")

@@ -910,6 +910,11 @@ def database(cfg: Config, audio: bool) -> int:
                         say(f"  {log_line}")
                 say("Run the installer again to retry; the log: python3 mac/backend.py logs setup")
                 return 1
+            for name in wanted:
+                s = steps.get(name)
+                if s and name not in done and s["status"] == "partial":
+                    # Ran through with a few items left: files the archive does not serve or ffmpeg cannot read
+                    say(f"{s['title']}: {s['detail']}")
             search = state.get("search") or {}
             say(f"sound database ready: {search.get('sounds', 0):,} searchable sounds"
                 + (", search by sound available" if search.get("by_sound") else ""))

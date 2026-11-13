@@ -26,16 +26,26 @@ class DatabaseClient:
     def __init__(self, database_url: str):
         self.database_url = database_url
         self.embedding_column = "text_embedding"
-        self.conn = db.connect(database_url)
-        # Reads only (plus the occasional mark_file, which commits itself). With
-        # autocommit no transaction stays open between requests, so an indexer
-        # running CREATE OR REPLACE VIEW is not blocked by this connection's
-        # last SELECT, which would otherwise hold its lock indefinitely.
-        self.conn.autocommit = True
+        self._conn = None
         db.ensure_schema(self.conn)
-        with self.conn.cursor() as cursor:
-            cursor.execute("SET hnsw.ef_search = 120")     # wider candidate list for the window search
         logger.info("Database connection established (using %s)", self.embedding_column)
+
+    @property
+    def conn(self):
+        """The connection; opened again once the database went away (PostgreSQL restarted
+        under the Windows or Mac backend, the laptop slept) instead of failing for good."""
+        if self._conn is None or self._conn.closed:
+            if self._conn is not None:
+                logger.warning("database connection lost; connecting again")
+            self._conn = db.connect(self.database_url)
+            # Reads only (plus the occasional mark_file, which commits itself). With
+            # autocommit no transaction stays open between requests, so an indexer
+            # running CREATE OR REPLACE VIEW is not blocked by this connection's
+            # last SELECT, which would otherwise hold its lock indefinitely.
+            self._conn.autocommit = True
+            with self._conn.cursor() as cursor:
+                cursor.execute("SET hnsw.ef_search = 120")     # wider candidate list for the window search
+        return self._conn
 
     def set_embedding_column(self, embedding_dim: int) -> None:
         """Pick the vector column that matches the loaded model (512 base, 768 large)."""
