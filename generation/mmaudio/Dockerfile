@@ -24,6 +24,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git ca-certificates ffmpeg libsndfile1 libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# MMAudio asks only for torch>=2.5.1. The constraints keep the base image's torch,
+# torchvision and torchaudio through every pip install below, so a rebuild cannot
+# lift torch to a version this torchaudio no longer loads with.
+RUN printf 'torch==2.5.1\ntorchvision==0.20.1\ntorchaudio==2.5.1\n' > /etc/pip-constraints.txt
+ENV PIP_CONSTRAINT=/etc/pip-constraints.txt
+
 # MMAudio source and dependencies, installed into the image.
 RUN git clone "${MMAUDIO_REPO}" /opt/MMAudio \
     && git -C /opt/MMAudio checkout --quiet "${MMAUDIO_REF}" \
