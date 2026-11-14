@@ -297,7 +297,9 @@ def _refine(candidate: dict, query: np.ndarray, piece_length: float,
 def _use_segments() -> bool:
     if AUDIO_INDEX in ("segments", "windows"):
         return AUDIO_INDEX == "segments"
-    if not _segments_state["ready"] and time.time() - _segments_state["checked"] > 300:
+    # Looked at again every half minute until it is ready: a search right after the setup
+    # page built the index must not answer from the empty window index for five minutes
+    if not _segments_state["ready"] and time.time() - _segments_state["checked"] > 30:
         _segments_state["checked"] = time.time()
         try:
             _segments_state["ready"] = db_client.segments_ready()
