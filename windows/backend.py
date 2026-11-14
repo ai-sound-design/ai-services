@@ -1270,9 +1270,11 @@ def install(options: dict[str, str], interactive: bool, only: str = "") -> int:
     return 0
 
 
-def database(cfg: Config, audio: bool) -> int:
-    """Fills the sound index as "Set everything up" on the setup page does; the setup
-    service does the work and this shows its progress (see the Mac's backend.py)."""
+def database(cfg: Config, audio: bool, build: bool = False) -> int:
+    """Fills the sound index as "Set everything up" on the setup page does: the prebuilt
+    BBC index from Hugging Face (or, with `build`, metadata and text embeddings made here),
+    the audio when asked for, the audio index; the setup service does the work and this
+    shows its progress (see the Mac's backend.py)."""
     late = wait_for(["postgres", "search", "setup"], cfg, minutes=5)
     if late:
         say(f"{', '.join(late)} does not answer; see: python windows\\backend.py status")
@@ -1290,8 +1292,8 @@ def database(cfg: Config, audio: bool) -> int:
 
     steps = {s["name"]: s for s in call("/status")["steps"]}
     archive = "bbc_archive" in steps
-    wanted = ["bbc_metadata", "text_embeddings"] + (["bbc_archive"] if archive else ["bbc_audio"] if audio else []) \
-        + ["audio_index"]
+    wanted = (["bbc_metadata", "text_embeddings"] if build else ["bbc_index"]) \
+        + (["bbc_archive"] if archive else ["bbc_audio"] if audio else []) + ["audio_index"]
     if audio and not archive and steps.get("bbc_audio", {}).get("status") != "complete":
         free = shutil.disk_usage(cfg.audio if cfg.audio.exists() else cfg.data).free // 2**30
         if free < 70:
@@ -1303,7 +1305,7 @@ def database(cfg: Config, audio: bool) -> int:
     say("(https://sound-effects.bbcrewind.co.uk/licensing).")
     if GUI:
         print("@@status Starting the sound database", flush=True)
-    call("/pipeline/start", {"download": audio})
+    call("/pipeline/start", {"download": audio, "prebuilt": not build})
     retried: set[str] = set()
     done: set[str] = set()
     line = ""
@@ -1339,7 +1341,7 @@ def database(cfg: Config, audio: bool) -> int:
                 print(f"\n   {steps[retry[0]]['title']} had failed before; trying it again", flush=True)
                 retried.add(retry[0])
                 call(f"/jobs/{retry[0]}/start", {})
-                call("/pipeline/start", {"download": audio})
+                call("/pipeline/start", {"download": audio, "prebuilt": not build})
                 continue
             if line and not GUI:
                 print()
@@ -1399,9 +1401,9 @@ def main() -> int:
         return install(options, interactive, only="webui" if command == "webui" else "")
     cfg = Config()
     if command == "database":
-        if [a for a in rest if a != "--audio"]:
-            raise SystemExit("database [--audio]")
-        return database(cfg, audio="--audio" in rest)
+        if [a for a in rest if a not in ("--audio", "--build-index")]:
+            raise SystemExit("database [--audio] [--build-index]")
+        return database(cfg, audio="--audio" in rest, build="--build-index" in rest)
     unknown = [n for n in rest if n not in ORDER and not n.isdigit()]
     if unknown and command != "logs":
         raise SystemExit(f"unknown service(s): {', '.join(unknown)}; known: {', '.join(ORDER)}")

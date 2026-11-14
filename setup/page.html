@@ -64,7 +64,8 @@
     <div class="toolbar">
       <button class="primary" id="pipeline-start">Set everything up</button>
       <button id="pipeline-stop">Stop</button>
-      <label><input type="checkbox" id="download" checked> download the BBC audio files (about 10 GB)</label>
+      <label><input type="checkbox" id="prebuilt" checked> the prebuilt BBC index from Hugging Face (about 6 GB, no audio)</label>
+      <label><input type="checkbox" id="download"> download the BBC audio files (about 10 GB)</label>
       <span class="detail" id="pipeline-state"></span>
     </div>
     <div id="steps"></div>
@@ -143,13 +144,13 @@ async function refresh() {
     $("#pipeline-state").textContent = d.external_indexer ? "an indexer started from the command line is running: " + d.external_indexer
       : d.pipeline.active ? "running the steps in order; a step that was interrupted is continued" : "";
     $("#pipeline-start").disabled = d.pipeline.active; $("#pipeline-stop").disabled = !d.pipeline.active;
-    if (d.pipeline.active) $("#download").checked = d.pipeline.download;
+    if (d.pipeline.active) { $("#download").checked = d.pipeline.download; $("#prebuilt").checked = d.pipeline.prebuilt !== false; }
     $("#foot").textContent = "Updated " + d.time + ". Closing this page changes nothing: the steps keep running in the setup container.";
   } catch (e) {
     $("#foot").textContent = "The setup service does not answer: " + e;
   }
 }
-$("#pipeline-start").onclick = () => post("/pipeline/start", {download: $("#download").checked});
+$("#pipeline-start").onclick = () => post("/pipeline/start", {download: $("#download").checked, prebuilt: $("#prebuilt").checked});
 $("#pipeline-stop").onclick = () => post("/pipeline/stop");
 refresh(); setInterval(refresh, 2500);
 </script>

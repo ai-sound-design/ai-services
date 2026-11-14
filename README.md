@@ -203,7 +203,7 @@ python windows\backend.py restart search         # after an edit or a change in 
 python windows\backend.py stop                   # all of them, until the next start or logon
 python windows\backend.py start
 python windows\backend.py uninstall              # stop everything, remove the logon task; data and .windows\ stay
-python windows\backend.py database [--audio]     # fill the sound index (the setup page's "Set everything up")
+python windows\backend.py database [--audio]     # fill the sound index (the setup page's "Set everything up"; --build-index builds it here)
 ```
 
 Next to the installation and in the Start menu: **Web UI**, **Setup page**,
@@ -295,7 +295,7 @@ python3 mac/backend.py restart search         # after an edit or a change in .en
 python3 mac/backend.py stop                   # all of them, until the next start or login
 python3 mac/backend.py start
 python3 mac/backend.py uninstall              # remove the agents and the app; data and .mac/ stay
-python3 mac/backend.py database [--audio]     # fill the sound index (the setup page's "Set everything up")
+python3 mac/backend.py database [--audio]     # fill the sound index (the setup page's "Set everything up"; --build-index builds it here)
 ```
 
 Where things are: the database in `<data folder>/postgres`, the models in
@@ -318,13 +318,18 @@ about a quarter slower. On an M1 Ultra an 8 s sound from a prompt takes about
 `http://localhost:8020` (service `setup`) shows the state of the stack: every
 service and whether its model is loaded, the download of the MMAudio weights
 and the vision-language model with progress, and the steps that fill the sound
-index: the BBC metadata, the text embeddings, the BBC audio files (registered
-from an existing archive folder, or downloaded), the audio index, and every
-folder under `data/libraries`. *Set everything up* runs the
+index: the prebuilt BBC index from Hugging Face
+([ai-sound-design/bbc-sound-index](https://huggingface.co/datasets/ai-sound-design/bbc-sound-index),
+about 6 GB: the metadata, the text embeddings and the audio index of the whole
+archive, no audio; a recording is fetched when it is used), or instead the BBC
+metadata and the text embeddings made here, then the BBC audio files (registered
+from an existing archive folder, or downloaded), the audio index over the files
+on disk, and every folder under `data/libraries`. *Set everything up* runs the
 steps in order; each can be paused and resumed and carries on where it stopped,
 also after a restart of the machine, since the steps only ever process what is
 still missing. The steps are the indexer's scripts below, so the command line
-does the same.
+does the same. The index is free for personal, educational and research use
+under the BBC's terms.
 
 ### Where things are stored
 
@@ -409,10 +414,13 @@ existing copy of the archive is registered instead, read-only:
 rows at its files.
 
 The search **by sound**, which the plugin's *Use database sounds* relies on,
-needs the audio itself: after `download.py` (your own libraries are on disk
-anyway) build the audio index. This takes hours for the whole BBC archive (about
-four on a laptop GPU), can be interrupted and resumed, and the partial index is
-usable right away; `index_folder.py` does it for a folder library on its own.
+needs the audio index. For the BBC archive it comes ready-made: `load_index.py`
+fetches it from Hugging Face and merges it in (`export_index.py` writes it from a
+finished index). Built here instead, it needs the audio on disk: after
+`download.py` (your own libraries are on disk anyway) run `embed_segments.py`.
+This takes hours for the whole BBC archive (about four on a laptop GPU), can be
+interrupted and resumed, and the partial index is usable right away;
+`index_folder.py` does it for a folder library on its own.
 
 ```bash
 docker compose run --rm indexer python embed_segments.py

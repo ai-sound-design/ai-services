@@ -82,6 +82,13 @@ SERVICES = [
 
 # The steps: the indexer's scripts. Progress comes from the database (see progress()).
 STEPS: dict[str, dict[str, Any]] = {
+    "bbc_index": {"title": "BBC Sound Effects: prebuilt index",
+                  "about": "The archive's records, their text embeddings and the audio index (segment vectors of "
+                           "every recording), fetched from Hugging Face (about 6 GB, no audio) and merged into the "
+                           "database: searchable by video, prompt and sound in minutes, instead of a 60 GB "
+                           "download and hours of indexing. A recording is fetched when it is used. Free for "
+                           "personal, educational and research use under the BBC's terms.",
+                  "command": [sys.executable, "load_index.py"]},
     "bbc_metadata": {"title": "BBC Sound Effects: metadata",
                      "about": "The archive's records (about 33,000), so it can be searched by video or prompt; "
                               "no audio is downloaded. Free for research use under the BBC's terms.",
@@ -103,16 +110,17 @@ STEPS: dict[str, dict[str, Any]] = {
                              "library pieces. Hours for the whole archive; the partial index is used right away.",
                     "command": [sys.executable, "embed_segments.py"]},
 }
-PIPELINE = ["bbc_metadata", "text_embeddings", "bbc_archive", "bbc_audio", "audio_index"]
+PIPELINE = ["bbc_index", "bbc_metadata", "text_embeddings", "bbc_archive", "bbc_audio", "audio_index"]
 ARCHIVE_DIR = Path(os.getenv("BBC_ARCHIVE_DIR", "/data/archive"))
 OWN_SOUNDS_DIR = Path(os.getenv("OWN_SOUNDS_DIR", "/data/own-sounds"))     # the folder given at installation
 OWN_SOUNDS_NAME = os.getenv("OWN_SOUNDS_NAME", "own")
 
 
 def pipeline_order(pipeline: dict) -> list[str]:
-    """The steps "Set everything up" runs: an existing archive is registered instead of
-    downloaded; the download only when it was asked for."""
-    order = ["bbc_metadata", "text_embeddings"]
+    """The steps "Set everything up" runs: the prebuilt index unless the index is to be
+    built here (metadata, embeddings, the audio index over the files on disk); an existing
+    archive is registered instead of downloaded; the download only when it was asked for."""
+    order = ["bbc_index"] if pipeline.get("prebuilt", True) else ["bbc_metadata", "text_embeddings"]
     if _disk_cache["archive_files"]:
         order.append("bbc_archive")
     elif pipeline.get("download", True):
@@ -361,6 +369,15 @@ def progress(libraries: list[dict]) -> list[dict]:
                       "started_at": str(job.get("started_at") or ""), "finished_at": str(job.get("finished_at") or "")})
 
     n = bbc.get("sounds", 0)
+    index = store.state("bbc_index", {}) or {}
+    # Complete once (nearly) every BBC sound has its segments: loaded by load_index.py, or
+    # built here before the prebuilt index existed
+    bbc_segmented = bbc.get("segment_indexed", 0)
+    index_complete = n >= BBC_EXPECTED * 0.95 and bbc_segmented >= n * 0.99
+    index_detail = index.get("message") or (f"{bbc_segmented:,} of {n:,} sounds with audio index" if n else "not loaded")
+    step("bbc_index", STEPS["bbc_index"]["title"], STEPS["bbc_index"]["about"], int(index.get("done") or 0),
+         int(index.get("total") or 0), "bytes" if index.get("phase") in ("download", "import") else "",
+         index_detail, index_complete)
     step("bbc_metadata", STEPS["bbc_metadata"]["title"], STEPS["bbc_metadata"]["about"], n, max(BBC_EXPECTED, n),
          "records", f"{n:,} records", n >= BBC_EXPECTED * 0.95 or (jobs.get("bbc_metadata", {}).get("status") == "done" and n > 0))
     step("text_embeddings", STEPS["text_embeddings"]["title"], STEPS["text_embeddings"]["about"], embedded, sounds,
@@ -577,7 +594,8 @@ async def job_log(name: str) -> dict:
 @app.post("/pipeline/start")
 async def pipeline_start(body: dict) -> dict:
     # "ran": the steps this run has started, each at most once (see supervise)
-    store.set_state("pipeline", {"active": True, "download": bool(body.get("download", True)), "ran": []})
+    store.set_state("pipeline", {"active": True, "download": bool(body.get("download", True)),
+                                 "prebuilt": bool(body.get("prebuilt", True)), "ran": []})
     return {"ok": True}
 
 

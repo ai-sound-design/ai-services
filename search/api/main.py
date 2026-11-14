@@ -252,6 +252,16 @@ def _envelope_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(1.0 / (1.0 + np.abs(ia - ib).mean()))
 
 
+def _decode_failed(candidate: dict, exc: Exception) -> None:
+    """A file that is not on disk (the prebuilt index, a sound not fetched yet) is no
+    warning; one that is there and cannot be read is."""
+    path = candidate.get("file_path")
+    if path and os.path.exists(path):
+        logger.warning("refine: could not decode %s: %s", path, exc)
+    else:
+        logger.debug("refine: %s is not on disk; the coarse match stands", path)
+
+
 def _refine(candidate: dict, query: np.ndarray, piece_length: float,
             query_samples: Optional[np.ndarray] = None, envelope_weight: float = 0.0) -> dict:
     """Locate the best `piece_length` seconds inside (and just around) a matched 10 s window.
@@ -264,7 +274,7 @@ def _refine(candidate: dict, query: np.ndarray, piece_length: float,
     try:
         region = audio.decode(candidate["file_path"], start=region_start, length=region_length)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("refine: could not decode %s: %s", candidate["file_path"], exc)
+        _decode_failed(candidate, exc)
         return candidate
     length = min(piece_length, len(region) / audio.SAMPLE_RATE)
     if length <= 0:
@@ -350,7 +360,8 @@ def _refine_fine(candidate: dict, query: np.ndarray, piece_length: float,
         try:
             region = audio.decode(candidate["file_path"], start=region_start, length=max(length, width) + 1.0)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("refine: could not decode %s: %s", candidate["file_path"], exc)
+            # No file on disk is the normal case with the prebuilt index: the coarse match stands
+            _decode_failed(candidate, exc)
             region = None
         if region is not None and len(region) / audio.SAMPLE_RATE >= length:
             hop = 0.1 if length <= 3.0 else 0.25
