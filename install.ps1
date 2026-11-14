@@ -263,7 +263,10 @@ cp "`$m" "/to/models/manifests/$path"
     if ($code -eq 3) { Warn "$model is not in $from; Ollama fetches it on the first start" }
     elseif ($code -ne 0) { Fail "Could not copy $model; see the messages above." }
 }
+# The compose project, as Compose picks it: COMPOSE_PROJECT_NAME in .env, else the name in
+# docker-compose.yml, else the folder's name; it prefixes the volumes
 $project = Env-Value "COMPOSE_PROJECT_NAME"
+if (-not $project -and ((Get-Content "docker-compose.yml" -Raw) -match "(?m)^name:\s*([A-Za-z0-9_-]+)")) { $project = $Matches[1] }
 if (-not $project) { $project = (Split-Path -Leaf $root).ToLower() -replace "[^a-z0-9_-]", "" }
 if (-not $ModelsDir -and $interactive -and $fresh) {
     Write-Host ""

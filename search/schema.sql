@@ -101,6 +101,8 @@ CREATE VIEW library_stats AS
                                                                 AS audio_indexed,
            COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM sound_fine f WHERE f.sound_id = sounds.id))
                                                                 AS segment_indexed,
+           COUNT(*) FILTER (WHERE file_exists AND EXISTS (SELECT 1 FROM sound_fine f WHERE f.sound_id = sounds.id))
+                                                                AS local_indexed,
            SUM(duration_seconds) / 3600.0                       AS hours
     FROM sounds
     GROUP BY library

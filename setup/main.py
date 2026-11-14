@@ -188,7 +188,7 @@ class Store:
         rows = self.query("SELECT * FROM library_stats")
         for r in rows:
             r["hours"] = round(float(r["hours"] or 0), 1)
-            for k in ("sounds", "embedded", "local_files", "audio_indexed", "segment_indexed"):
+            for k in ("sounds", "embedded", "local_files", "audio_indexed", "segment_indexed", "local_indexed"):
                 r[k] = int(r.get(k) or 0)
         return rows
 
@@ -350,7 +350,7 @@ def progress(libraries: list[dict]) -> list[dict]:
     sounds = sum(r["sounds"] for r in libraries)
     embedded = sum(r["embedded"] for r in libraries)
     local = sum(r["local_files"] for r in libraries)
-    segmented = sum(r["segment_indexed"] for r in libraries)
+    local_indexed = sum(r["local_indexed"] for r in libraries)
     jobs = store.jobs()
     seg = store.segments()
     steps = []
@@ -388,7 +388,9 @@ def progress(libraries: list[dict]) -> list[dict]:
     missing = bbc_sounds - bbc_files
     # A few sounds the archive no longer serves do not keep the step from being complete
     have_all = bbc_sounds > 0 and missing <= max(0, int(bbc_sounds * 0.005))
-    gap = f", {missing:,} without a file (the archive does not serve every sound)" if 0 < missing else ""
+    # A handful missing: sounds the archive no longer serves; many: the audio was not downloaded
+    gap = (f", {missing:,} without a file (the archive does not serve every sound)" if 0 < missing <= max(1, int(bbc_sounds * 0.005))
+           else f", {missing:,} without a file" if missing > 0 else "")
     if archive:
         step("bbc_archive", STEPS["bbc_archive"]["title"], STEPS["bbc_archive"]["about"], bbc_files, bbc_sounds, "files",
              f"{archive:,} audio files in the archive folder, {bbc_files:,} of {bbc_sounds:,} sounds have a file{gap}",
@@ -397,9 +399,16 @@ def progress(libraries: list[dict]) -> list[dict]:
          f"{bbc_files:,} of {bbc_sounds:,} files, {gb:.1f} GB downloaded{gap}"
          + (" (not needed: the archive folder is used)" if archive else ""), have_all)
     hours = sum(r["hours"] for r in libraries if r["local_files"])
-    step("audio_index", STEPS["audio_index"]["title"], STEPS["audio_index"]["about"], segmented, local, "sounds",
-         f"{segmented:,} of {local:,} sounds on disk, {seg['segments']:,} segments, {seg['bytes'] / 1e9:.1f} GB in the index",
-         local > 0 and segmented >= local)
+    in_index = f"{seg['segments']:,} segments, {seg['bytes'] / 1e9:.1f} GB in the index"
+    if local:
+        step("audio_index", STEPS["audio_index"]["title"], STEPS["audio_index"]["about"], local_indexed, local, "sounds",
+             f"{local_indexed:,} of {local:,} sounds on disk, {in_index}", local_indexed >= local)
+    else:
+        # Nothing on disk to index: the prebuilt index serves the search by sound, a recording
+        # is fetched when it is used; complete once that index is in place (not while it loads)
+        step("audio_index", STEPS["audio_index"]["title"], STEPS["audio_index"]["about"], 0, 0, "sounds",
+             f"no audio on disk; {in_index}" if seg["segments"] else "no audio on disk, nothing to index yet",
+             seg["segments"] > 0 and jobs.get("bbc_index", {}).get("status") != "running")
     for folder, files in sorted(_disk_cache["folders"].items()):
         row = by_name.get(folder, {})
         done = min(row.get("embedded", 0), row.get("segment_indexed", 0))

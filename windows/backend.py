@@ -1303,6 +1303,11 @@ def database(cfg: Config, audio: bool, build: bool = False) -> int:
             return 1
     say("BBC Sound Effects: free for personal, educational and research use under the BBC's terms")
     say("(https://sound-effects.bbcrewind.co.uk/licensing).")
+    if audio and not archive:
+        say("All of its audio (about 60 GB) is downloaded as well, for working without internet: some hours.")
+    elif not archive and not build:
+        say("Without its audio: the ready-made index covers the search by video, prompt and sound; a recording")
+        say("is fetched from the BBC the first time it is used. The audio option keeps all of it on disk.")
     if GUI:
         print("@@status Starting the sound database", flush=True)
     call("/pipeline/start", {"download": audio, "prebuilt": not build})

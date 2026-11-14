@@ -846,10 +846,10 @@ def database(cfg: Config, audio: bool, build: bool = False) -> int:
     say("BBC Sound Effects: free for personal, educational and research use under the BBC's terms")
     say("(https://sound-effects.bbcrewind.co.uk/licensing).")
     if audio and not archive:
-        say("All of its audio (about 60 GB) is downloaded, then indexed: several hours.")
-    elif not archive:
-        say("Without its audio: a sound is fetched the first time it is used. The search by sound and the")
-        say("Hybrid mode's library pieces need audio on disk (the installer's audio option).")
+        say("All of its audio (about 60 GB) is downloaded as well, for working without internet: some hours.")
+    elif not archive and not build:
+        say("Without its audio: the ready-made index covers the search by video, prompt and sound; a recording")
+        say("is fetched from the BBC the first time it is used. The audio option keeps all of it on disk.")
     say("This window can be closed at any time: the work goes on in the background, also after a")
     say("restart, and running the installer again shows where it is.")
     if GUI:
