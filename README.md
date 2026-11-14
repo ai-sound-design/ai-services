@@ -392,6 +392,12 @@ and hybrid have a *Test* button each, which calls the same endpoints.
 
 ### Fill the sound index
 
+The quick way is the ready-made index of the BBC archive on Hugging Face,
+[ai-sound-design/bbc-sound-index](https://huggingface.co/datasets/ai-sound-design/bbc-sound-index)
+(about 6 GB, no audio): the setup page's first step loads it, or
+`docker compose run --rm indexer python load_index.py`. What follows builds the
+index here instead, or adds your own libraries to it.
+
 The search starts empty. Index a folder of your own sounds, the BBC Sound
 Effects Archive, or both; details in [`search/README.md`](search/README.md).
 
