@@ -61,6 +61,11 @@ VLM_MODEL = os.getenv("VLM_MODEL", "gemma4:e4b-it-qat")
 VLM_API = os.getenv("VLM_API", "ollama").strip().lower()
 BBC_FORMAT = os.getenv("BBC_AUDIO_FORMAT", "mp3")
 BBC_EXPECTED = 33_000                      # records in the archive, for the bar before the harvest is done
+# Where the BBC serves its recordings (BBC_MEDIA_BASE in .env if the archive ever moves); the page
+# asks for one of them with HEAD every five minutes, so a moved archive shows here, not as a failed preview
+BBC_MEDIA_BASE = os.getenv("BBC_MEDIA_BASE", "").strip().rstrip("/") or "https://sound-effects-media.bbcrewind.co.uk"
+BBC_PROBE_SOUND = "07026189"
+_bbc_probe: dict[str, Any] = {"at": 0.0, "ok": False, "detail": "not checked yet"}
 LOG_DIR = Path(os.getenv("SETUP_LOG_DIR", "/data/setup/logs"))
 DOCKER_SOCKET = Path(os.getenv("DOCKER_SOCKET", "/var/run/docker.sock"))
 DATABASE_STORE = os.getenv("DATABASE_STORE", "postgres-data")      # a volume name, or a folder outside Docker
@@ -500,6 +505,23 @@ async def probe(url: str) -> tuple[bool, Any]:
         return False, None
 
 
+async def probe_bbc() -> dict[str, Any]:
+    """Whether the BBC serves its recordings: a HEAD on one of them, kept for five minutes."""
+    if time.time() - _bbc_probe["at"] > 300:
+        host = BBC_MEDIA_BASE.split("//", 1)[-1]
+        try:
+            async with httpx.AsyncClient(timeout=6.0, follow_redirects=True) as client:
+                answer = await client.head(f"{BBC_MEDIA_BASE}/mp3/{BBC_PROBE_SOUND}.mp3")
+            ok = answer.status_code == 200
+            detail = (f"{host} answers; a recording is fetched from it when it is used" if ok else
+                      f"{host} answers {answer.status_code}: recordings cannot be fetched. If the archive moved, "
+                      "BBC_MEDIA_BASE in .env names the new host")
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = False, f"{host} not reachable ({exc.__class__.__name__}): recordings cannot be fetched until it is"
+        _bbc_probe.update(at=time.time(), ok=ok, detail=detail)
+    return _bbc_probe
+
+
 vlm: dict[str, Any] = {"task": None, "status": "", "completed": 0, "total": 0, "error": None}
 
 
@@ -530,6 +552,7 @@ async def status() -> dict:
     containers, libraries = await asyncio.gather(asyncio.to_thread(docker_containers), asyncio.to_thread(store.libraries))
     kick_disk_refresh()
     healths = await asyncio.gather(*(probe(url) for _, _, url in SERVICES))
+    bbc = await probe_bbc()
     services, models, search = [], {}, {}
     for (title, service, _), (ok, body) in zip(SERVICES, healths):
         box = containers.get(service, {})
@@ -559,6 +582,8 @@ async def status() -> dict:
             models["mmaudio"] = {"title": "MMAudio weights (about 10 GB)", "ready": ok,
                                  "detail": "ready" if ok else (box.get("last_log") or "the container fetches them at its first start")}
         services.append({"title": title, "service": service, "state": state, "detail": detail})
+    services.append({"title": "BBC Sound Effects audio (on the BBC's server)", "service": "bbc",
+                     "state": "ok" if bbc["ok"] else "down", "detail": bbc["detail"]})
     if "vlm" not in models and VLM_API != "ollama":
         models["vlm"] = {"title": "Vision-language model", "ready": True, "detail": f"external: {OLLAMA_URL}"}
     if "clap" not in models:

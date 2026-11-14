@@ -401,6 +401,9 @@ before the int8 format of the 2 s windows holds float16 ones, which the search
 still reads; `docker compose run --rm indexer python quantize_fine.py --vacuum`
 converts them in place and halves the table. The dataset also holds the windows
 as float16 (`BBC_INDEX_VARIANT=fp16` in `.env`, or `load_index.py --variant fp16`).
+A recording is fetched from the BBC when it is used; the setup page shows whether
+the BBC's media host answers, and should the archive ever move, `BBC_MEDIA_BASE` in
+`.env` points the fetch at the new host without re-indexing.
 
 The search starts empty. Index a folder of your own sounds, the BBC Sound
 Effects Archive, or both; details in [`search/README.md`](search/README.md).

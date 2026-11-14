@@ -34,7 +34,8 @@ import urllib.request
 from common import db
 
 API_URL = "https://sound-effects-api.bbcrewind.co.uk/api/sfx/search"
-MEDIA_BASE = "https://sound-effects-media.bbcrewind.co.uk"
+# Where the BBC serves its recordings; BBC_MEDIA_BASE in .env if the archive ever moves
+MEDIA_BASE = os.getenv("BBC_MEDIA_BASE", "").strip().rstrip("/") or "https://sound-effects-media.bbcrewind.co.uk"
 USER_AGENT = "ai-sound-services-indexer"
 LIBRARY = "bbc"
 AUDIO_FORMAT = os.getenv("BBC_AUDIO_FORMAT", "mp3").lower()

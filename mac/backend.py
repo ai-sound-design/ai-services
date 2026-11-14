@@ -177,6 +177,7 @@ def search_env(cfg: Config) -> dict[str, str]:
             "OWN_SOUNDS_NAME": e.get("OWN_SOUNDS_NAME") or "own", "BBC_AUDIO_FORMAT": e.get("BBC_AUDIO_FORMAT") or "mp3",
             "CLAP_MODEL": e.get("CLAP_MODEL") or "laion/clap-htsat-fused", "AUDIO_FETCH": e.get("AUDIO_FETCH") or "on_demand",
             "BBC_INDEX_VARIANT": e.get("BBC_INDEX_VARIANT") or "",
+            "BBC_MEDIA_BASE": e.get("BBC_MEDIA_BASE") or "",
             **{k: e[k] for k in ("AUDIO_INDEX", "SEGMENT_THRESHOLD", "REFINE_TOP", "XCLIP_MODEL", "CLAP_CPU_FEATURES") if e.get(k)}}
 
 

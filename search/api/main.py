@@ -21,6 +21,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from urllib.parse import urlsplit
 import threading
 import time
 import urllib.request
@@ -46,6 +47,8 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = db.DATABASE_URL
 MODEL_NAME = os.getenv("XCLIP_MODEL", "microsoft/xclip-base-patch32-16-frames")
 AUDIO_FETCH = os.getenv("AUDIO_FETCH", "on_demand").strip().lower()      # on_demand | local_only
+# The BBC's media host, if the archive ever moves: the stored links are fetched from it instead
+BBC_MEDIA_BASE = os.getenv("BBC_MEDIA_BASE", "").strip().rstrip("/")
 AUDIO_DIR = db.AUDIO_DIR
 FETCH_USER_AGENT = "ai-sound-services-search"
 DEVICE = torch_device()
@@ -508,6 +511,8 @@ async def _resolve_audio(sound: dict) -> Path:
         if path and path.exists():
             return path
         url = sound["media_url"]
+        if BBC_MEDIA_BASE and sound.get("library") == "bbc":
+            url = BBC_MEDIA_BASE + urlsplit(url).path
         suffix = Path(url.split("?")[0]).suffix or ".mp3"
         target = AUDIO_DIR / sound["library"] / (Path(str(sound["external_id"])).name + suffix)
         logger.info("fetching sound %d from %s", sound["id"], url)
