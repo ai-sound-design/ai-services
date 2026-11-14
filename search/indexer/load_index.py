@@ -5,8 +5,13 @@ index, as export_index.py wrote them. From Hugging Face (BBC_INDEX_REPO, default
 ai-sound-design/bbc-sound-index) or from a folder with the files (--files). No audio is
 in it: a recording is fetched from the BBC when it is previewed or imported.
 
-    python load_index.py                  # DATABASE_URL as the indexer uses it
-    python load_index.py --files /path    # the export folder instead of the download
+    python load_index.py                     # DATABASE_URL as the indexer uses it
+    python load_index.py --files /path       # the export folder instead of the download
+    python load_index.py --variant fp16      # the fine windows as float16 (BBC_INDEX_VARIANT)
+
+The manifest names the files of the default index (fine windows as int8) and, under
+"variants", the files that differ in another form of it, side by side in the same folder
+(sound_fine.int8.copy.gz, sound_fine.fp16.copy.gz).
 
 Rows are matched by the BBC's own ids, so an index that is already there (built here,
 or loaded before) is replaced in place and the ids of other libraries are untouched. The
@@ -38,6 +43,7 @@ log = logging.getLogger("load_index")
 
 REPO_ID = os.getenv("BBC_INDEX_REPO", "ai-sound-design/bbc-sound-index")
 REVISION = os.getenv("BBC_INDEX_REVISION") or None
+VARIANT = os.getenv("BBC_INDEX_VARIANT", "").strip().strip("/")
 DOWNLOAD_DIR = Path(os.getenv("INDEX_DOWNLOAD_DIR") or Path(os.getenv("SETUP_LOG_DIR", "/data/setup/logs")).parent / "index-download")
 STAGING = "bbc_index_staging"
 TABLES = ("sounds", "sound_segments", "sound_fine")
@@ -87,15 +93,27 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download(progress: Progress) -> Path:
+def with_variant(manifest: dict, variant: str) -> dict:
+    """The manifest with the variant's files in place of the default ones."""
+    if not variant:
+        return manifest
+    variants = manifest.get("variants") or {}
+    if variant not in variants:
+        raise SystemExit(f"the index has no variant {variant!r}; there is: {', '.join(variants) or 'none'}")
+    chosen = variants[variant]
+    return {**manifest, "tables": {**manifest["tables"], **chosen["tables"]},
+            "fine_vectors": chosen.get("fine_vectors", manifest.get("fine_vectors"))}
+
+
+def download(progress: Progress, variant: str) -> tuple[Path, dict]:
     """The manifest and the three files from Hugging Face into DOWNLOAD_DIR, resumable;
     the bytes on disk so far are the progress."""
     from huggingface_hub import hf_hub_download
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    progress.set("download", 0, 0, f"fetching the index from huggingface.co/datasets/{REPO_ID}")
+    progress.set("download", 0, 0, f"fetching the index from huggingface.co/datasets/{REPO_ID}" + (f" ({variant})" if variant else ""))
     manifest_path = Path(hf_hub_download(REPO_ID, "manifest.json", repo_type="dataset", revision=REVISION, local_dir=DOWNLOAD_DIR))
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = with_variant(json.loads(manifest_path.read_text(encoding="utf-8")), variant)
     total = sum(t["bytes"] for t in manifest["tables"].values())
     stop = threading.Event()
 
@@ -112,7 +130,7 @@ def download(progress: Progress) -> Path:
     finally:
         stop.set()
         watcher.join()
-    return DOWNLOAD_DIR
+    return DOWNLOAD_DIR, manifest
 
 
 def verify(folder: Path, manifest: dict, progress: Progress) -> None:
@@ -220,6 +238,7 @@ def load(connection, folder: Path, manifest: dict, progress: Progress) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--files", help="a folder with manifest.json and the three files, instead of the download")
+    parser.add_argument("--variant", default=VARIANT, help="another form of the index named in the manifest, e.g. fp16 (default: int8)")
     parser.add_argument("--keep", action="store_true", help="keep the downloaded files afterwards")
     parser.add_argument("--force", action="store_true", help="load again even if this index is in place")
     args = parser.parse_args()
@@ -229,12 +248,12 @@ def main() -> int:
     before = loaded_before(connection)
     progress = Progress()
     try:
+        variant = args.variant.strip()
         if args.files:
             folder = Path(args.files)
-            manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+            manifest = with_variant(json.loads((folder / "manifest.json").read_text(encoding="utf-8")), variant)
         else:
-            folder = download(progress)
-            manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+            folder, manifest = download(progress, variant)
         key = hashlib.sha256(json.dumps(manifest["tables"], sort_keys=True).encode()).hexdigest()[:16]
         with connection.cursor() as cursor:
             cursor.execute("SELECT COUNT(*) FROM sounds s WHERE s.library = %s AND EXISTS "

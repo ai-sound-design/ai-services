@@ -399,7 +399,8 @@ The quick way is the ready-made index of the BBC archive on Hugging Face,
 index here instead, or adds your own libraries to it. An index loaded or built
 before the int8 format of the 2 s windows holds float16 ones, which the search
 still reads; `docker compose run --rm indexer python quantize_fine.py --vacuum`
-converts them in place and halves the table.
+converts them in place and halves the table. The dataset also holds the windows
+as float16 (`BBC_INDEX_VARIANT=fp16` in `.env`, or `load_index.py --variant fp16`).
 
 The search starts empty. Index a folder of your own sounds, the BBC Sound
 Effects Archive, or both; details in [`search/README.md`](search/README.md).

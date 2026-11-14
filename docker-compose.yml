@@ -153,6 +153,7 @@ services:
       BBC_AUDIO_FORMAT: ${BBC_AUDIO_FORMAT:-mp3}
       CLAP_MODEL: ${CLAP_MODEL:-laion/clap-htsat-fused}
       HF_HOME: /models/huggingface
+      BBC_INDEX_VARIANT: ${BBC_INDEX_VARIANT:-}       # another form of the prebuilt index, e.g. fp16
     volumes:
       - ${AUDIO_HOST_DIR:-./data/audio}:/data/audio
       - ${LIBRARIES_HOST_DIR:-./data/libraries}:/data/libraries:ro
@@ -182,6 +183,7 @@ services:
       BBC_AUDIO_FORMAT: ${BBC_AUDIO_FORMAT:-mp3}
       CLAP_MODEL: ${CLAP_MODEL:-laion/clap-htsat-fused}
       HF_HOME: /models/huggingface
+      BBC_INDEX_VARIANT: ${BBC_INDEX_VARIANT:-}       # another form of the prebuilt index, e.g. fp16
       VLM_URL: ${VLM_URL:-http://ollama:11434}
       VLM_API: ${VLM_API:-ollama}
       VLM_MODEL: ${VLM_MODEL:-gemma4:e4b-it-qat}

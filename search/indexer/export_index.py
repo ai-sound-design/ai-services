@@ -27,6 +27,21 @@ import psycopg2
 
 REPO_ID = "ai-sound-design/bbc-sound-index"
 LIBRARY = "bbc"
+# The forms of the fine windows' vectors (common/audio.py pack_fine), as the manifest describes them.
+# The int8 numbers were measured on 2026-11-14 against the float16 windows of the same index.
+FINE_FORMS = {
+    "int8": {"form": "int8",
+             "layout": "int8 x 512 per 2 s window, row-major, in sound_fine.vectors; one float16 scale per window "
+                       "(max |v| / 127) in sound_fine.scales; a vector is int8 * scale",
+             "precision": "cosine error to the float16 vectors: mean 2.7e-5, p99 4.3e-5, max 5.7e-5 (6,577 windows). "
+                          "Search by sound, refine stage, 300 queries over the top 15 candidates: the top result the "
+                          "same in 100 % (1 s queries) and 99.7 % (3 s), scores within 0.0015; 60 query clips through "
+                          "the API without audio on disk: the top result the same in 59, the top 3 in all, scores "
+                          "within 0.0007"},
+    "fp16": {"form": "fp16",
+             "layout": "float16 x 512 per 2 s window, row-major, in sound_fine.vectors (sound_fine.scales NULL)",
+             "precision": "the vectors as CLAP produced them, rounded to float16: the reference"},
+}
 # Table -> how its rows are selected; columns come from the database itself
 TABLES = {
     "sounds": {"from": "sounds t", "where": f"t.library = '{LIBRARY}'", "order": "t.id",
@@ -83,6 +98,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", required=True, help="folder for the export (created)")
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="defaults to DATABASE_URL")
+    parser.add_argument("--variant", action="append", default=[], metavar="DIR",
+                        help="another export whose differing files join the manifest under 'variants', named by the "
+                             "form in their file name (sound_fine.fp16.copy.gz: fp16); copy those files beside this export's")
     args = parser.parse_args()
     if not args.database_url:
         sys.exit("DATABASE_URL is not set")
@@ -98,7 +116,6 @@ def main() -> int:
                 "text_embeddings": {"text_embedding": "X-CLIP base (microsoft/xclip-base-patch32), 512",
                                     "text_embedding_large": "X-CLIP large, 768"},
                 "audio_index": parameters(),
-                "fine_vectors": "int8, one float16 scale per 2 s window (sound_fine.scales); float16 where scales is NULL",
                 "tables": {}}
     with psycopg2.connect(args.database_url) as connection:
         with connection.cursor() as cursor:
@@ -114,7 +131,13 @@ def main() -> int:
                 query = f"SELECT {select} FROM {spec['from']}{where} ORDER BY {spec['order']}"
                 cursor.execute(f"SELECT COUNT(*) FROM {spec['from']}{where}")
                 rows = cursor.fetchone()[0]
-                path = out / f"{table}.copy.gz"
+                form = ""
+                if table == "sound_fine":
+                    # Named by the form of the windows' vectors, so both forms can sit in one folder
+                    cursor.execute("SELECT COUNT(*) FILTER (WHERE scales IS NULL) FROM sound_fine")
+                    form = ".fp16" if cursor.fetchone()[0] else ".int8"
+                    manifest["fine_vectors"] = FINE_FORMS[form[1:]]
+                path = out / f"{table}{form}.copy.gz"
                 print(f"== {table}: {rows:,} rows -> {path.name}", flush=True)
                 started = time.time()
                 with gzip.open(path, "wb", compresslevel=6) as compressed:
@@ -124,6 +147,21 @@ def main() -> int:
                       f"{time.time() - started:.0f} s", flush=True)
                 manifest["tables"][table] = {"file": path.name, "rows": rows, "columns": names,
                                              "bytes": path.stat().st_size, "raw_bytes": counting.raw, "sha256": sha256(path)}
+    for other in args.variant:
+        # Another form of the same index: the files whose name carries a form (sound_fine.fp16.copy.gz)
+        # join under "variants"; the rest are the shared files of this export
+        theirs = json.loads((Path(other) / "manifest.json").read_text(encoding="utf-8"))
+        for name, table in theirs["tables"].items():
+            ours = manifest["tables"][name]
+            if table["rows"] != ours["rows"]:
+                sys.exit(f"{other}: {name} has {table['rows']:,} rows, this export {ours['rows']:,}; a variant holds the same sounds")
+            parts = Path(table["file"]).name.split(".")
+            if len(parts) >= 4 and parts[1] != Path(ours["file"]).name.split(".")[1]:
+                variant = manifest.setdefault("variants", {}).setdefault(parts[1], {"tables": {}})
+                variant["tables"][name] = table
+                if name == "sound_fine":
+                    variant["fine_vectors"] = theirs.get("fine_vectors") if isinstance(theirs.get("fine_vectors"), dict) else FINE_FORMS.get(parts[1])
+                print(f"== variant {parts[1]}: {table['file']} ({table['bytes'] / 1e9:.2f} GB); copy it beside the files here", flush=True)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"== manifest.json written; {sum(t['bytes'] for t in manifest['tables'].values()) / 1e9:.2f} GB in all", flush=True)
     return 0
