@@ -1446,4 +1446,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except subprocess.CalledProcessError as error:
+        # One line that says which program stopped, not a traceback through this script
+        program = Path(str(error.cmd[0])).name if error.cmd else "a program"
+        print(f"   {program} stopped with exit code {error.returncode}: {' '.join(str(c) for c in error.cmd[:4])}", flush=True)
+        if GUI:
+            print(f"@@error {program} stopped with exit code {error.returncode}; the details above say why.", flush=True)
+        sys.exit(1)
