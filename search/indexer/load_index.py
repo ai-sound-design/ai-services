@@ -55,18 +55,19 @@ class Progress:
         self.connection.autocommit = True
         self.last = 0.0
 
-    def set(self, phase: str, done: int = 0, total: int = 0, message: str = "", **extra) -> None:
+    def set(self, phase: str, done: int = 0, total: int = 0, message: str = "", quiet: bool = False, **extra) -> None:
         state = {"phase": phase, "done": done, "total": total, "message": message, "at": time.time(), **extra}
         with self.connection.cursor() as cursor:
             cursor.execute("INSERT INTO setup_state (key, value) VALUES ('bbc_index', %s) "
                            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (Json(state),))
-        if message:
+        if message and not quiet:
             log.info("%s", message)
 
     def tick(self, phase: str, done: int, total: int, message: str = "") -> None:
+        """The numbers every two seconds, for the page; the log gets the message once (set)."""
         if time.time() - self.last > 2:
             self.last = time.time()
-            self.set(phase, done, total, message)
+            self.set(phase, done, total, message, quiet=True)
 
 
 def loaded_before(connection) -> dict:
