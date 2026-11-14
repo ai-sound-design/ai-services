@@ -171,17 +171,29 @@ class Config:
 # ── programs installed on Windows ────────────────────────────────────────────
 
 def registry_path() -> str:
-    """PATH as new programs see it: the machine's and the user's, from the registry (a
-    winget install extends them, but not this process's)."""
-    parts = []
+    """PATH as new programs see it: the machine's and the user's from the registry (a winget
+    install extends them, but not this process's), then what this process has on top, each
+    folder once. A PATH that repeats itself soon passes the 8 KB cmd.exe can take, and npm's
+    scripts then find neither node nor the system's own tools."""
+    sources = []
     for hive, key in ((winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
                       (winreg.HKEY_CURRENT_USER, r"Environment")):
         try:
             with winreg.OpenKey(hive, key) as handle:
-                parts.append(os.path.expandvars(winreg.QueryValueEx(handle, "Path")[0]))
+                sources.append(os.path.expandvars(winreg.QueryValueEx(handle, "Path")[0]))
         except OSError:
             pass
-    return ";".join(parts + [os.environ.get("PATH", "")])
+    sources.append(os.environ.get("PATH", ""))
+    seen: set[str] = set()
+    parts = []
+    for source in sources:
+        for folder in source.split(";"):
+            folder = folder.strip()
+            key = folder.rstrip("\\").lower()
+            if folder and key not in seen:
+                seen.add(key)
+                parts.append(folder)
+    return ";".join(parts)
 
 
 def find_exe(name: str, *candidates: str) -> Path | None:

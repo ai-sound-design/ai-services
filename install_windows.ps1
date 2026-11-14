@@ -68,10 +68,17 @@ function Capture($exe, [string[]]$arguments) {
     return ($out | Out-String).Trim()
 }
 function Refresh-Path {
-    # A winget install extends the PATH in the registry, not in this process
-    $machine = [Environment]::GetEnvironmentVariable("Path", "Machine")
-    $user = [Environment]::GetEnvironmentVariable("Path", "User")
-    $env:Path = "$machine;$user;$env:Path"
+    # A winget install extends the PATH in the registry, not in this process: the machine's, the
+    # user's, then this process's own entries, each folder once. Prepending blindly after every
+    # install soon passes the 8 KB cmd.exe can take, and npm's scripts then find nothing.
+    $seen = @{}; $parts = @()
+    foreach ($source in [Environment]::GetEnvironmentVariable("Path", "Machine"), [Environment]::GetEnvironmentVariable("Path", "User"), $env:Path) {
+        foreach ($folder in ([string]$source).Split(";")) {
+            $f = $folder.Trim(); $k = $f.TrimEnd("\").ToLower()
+            if ($f -and -not $seen.ContainsKey($k)) { $seen[$k] = $true; $parts += $f }
+        }
+    }
+    $env:Path = ($parts -join ";")
 }
 function Winget-Install($id, $what) {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { Fail "$what is not installed, and winget is missing to install it. Install $what by hand, then run this again." }
