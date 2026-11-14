@@ -563,8 +563,14 @@ def ensure_database(cfg: Config) -> None:
             break
         time.sleep(1)
     user = cfg.db_user.replace('"', '""')
-    if not psql(cfg, "postgres", f"SELECT 1 FROM pg_database WHERE datname = '{cfg.db_name}'").strip():
-        psql(cfg, "postgres", f"CREATE DATABASE \"{cfg.db_name}\" OWNER \"{user}\"")
+    exists = f"SELECT 1 FROM pg_database WHERE datname = '{cfg.db_name}'"
+    if not psql(cfg, "postgres", exists).strip():
+        try:
+            psql(cfg, "postgres", f"CREATE DATABASE \"{cfg.db_name}\" OWNER \"{user}\"")
+        except subprocess.CalledProcessError:
+            # The supervisor creates it too when it starts postgres; one of the two loses
+            if not psql(cfg, "postgres", exists).strip():
+                raise
     psql(cfg, cfg.db_name, "CREATE EXTENSION IF NOT EXISTS vector")
 
 
@@ -945,6 +951,12 @@ def start(names: list[str], cfg: Config) -> None:
     start_supervisor()
     for name in names:
         port = cfg.ports.get(name)
+        # The supervisor starts it within moments; a port that is busy before it got to it is
+        # the service itself coming up, not another program
+        for _ in range(10):
+            if pid_of(name) or not (port and port_busy(port)):
+                break
+            time.sleep(0.5)
         if pid_of(name):
             say(f"{name}: already running")
         elif port and port_busy(port):
