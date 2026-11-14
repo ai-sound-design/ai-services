@@ -192,8 +192,9 @@ def load(connection, folder: Path, manifest: dict, progress: Progress) -> dict:
                        "JOIN idmap m ON m.old_id = g.sound_id")
         segments = cursor.rowcount
         cursor.execute("DELETE FROM sound_fine WHERE sound_id IN (SELECT new_id FROM idmap)")
-        cursor.execute(f"INSERT INTO sound_fine (sound_id, window_seconds, offsets, levels, vectors) "
-                       f"SELECT m.new_id, f.window_seconds, f.offsets, f.levels, f.vectors FROM {STAGING}.sound_fine f "
+        # scales: NULL in an index exported before the int8 format (float16 vectors, still read)
+        cursor.execute(f"INSERT INTO sound_fine (sound_id, window_seconds, offsets, levels, vectors, scales) "
+                       f"SELECT m.new_id, f.window_seconds, f.offsets, f.levels, f.vectors, f.scales FROM {STAGING}.sound_fine f "
                        "JOIN idmap m ON m.old_id = f.sound_id")
         fine = cursor.rowcount
         cursor.execute("SELECT COUNT(*) FROM idmap")
@@ -224,6 +225,7 @@ def main() -> int:
     args = parser.parse_args()
     connection = db.connect()
     connection.autocommit = False
+    db.ensure_schema(connection)        # an empty database gets the tables, an older one the new columns
     before = loaded_before(connection)
     progress = Progress()
     try:

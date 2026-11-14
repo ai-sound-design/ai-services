@@ -320,7 +320,7 @@ service and whether its model is loaded, the download of the MMAudio weights
 and the vision-language model with progress, and the steps that fill the sound
 index: the prebuilt BBC index from Hugging Face
 ([ai-sound-design/bbc-sound-index](https://huggingface.co/datasets/ai-sound-design/bbc-sound-index),
-about 6 GB: the metadata, the text embeddings and the audio index of the whole
+about 2.5 GB: the metadata, the text embeddings and the audio index of the whole
 archive, no audio; a recording is fetched when it is used), or instead the BBC
 metadata and the text embeddings made here, then the BBC audio files (registered
 from an existing archive folder, or downloaded), the audio index over the files
@@ -394,9 +394,12 @@ and hybrid have a *Test* button each, which calls the same endpoints.
 
 The quick way is the ready-made index of the BBC archive on Hugging Face,
 [ai-sound-design/bbc-sound-index](https://huggingface.co/datasets/ai-sound-design/bbc-sound-index)
-(about 6 GB, no audio): the setup page's first step loads it, or
+(about 2.5 GB, no audio): the setup page's first step loads it, or
 `docker compose run --rm indexer python load_index.py`. What follows builds the
-index here instead, or adds your own libraries to it.
+index here instead, or adds your own libraries to it. An index loaded or built
+before the int8 format of the 2 s windows holds float16 ones, which the search
+still reads; `docker compose run --rm indexer python quantize_fine.py --vacuum`
+converts them in place and halves the table.
 
 The search starts empty. Index a folder of your own sounds, the BBC Sound
 Effects Archive, or both; details in [`search/README.md`](search/README.md).

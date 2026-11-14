@@ -81,15 +81,19 @@ CREATE INDEX IF NOT EXISTS idx_segment_emb ON sound_segments
 
 -- The 2 s windows themselves, one row per sound and not indexed: the search uses
 -- them to find the best stretch inside a matched segment without decoding the
--- file and running CLAP again. `vectors` is float16, len(offsets) x 512, row-major;
--- `levels` the RMS of each window in dBFS.
+-- file and running CLAP again. `vectors` is int8, len(offsets) x 512, row-major,
+-- with one float16 scale per window in `scales` (common/audio.py pack_fine);
+-- rows from before the int8 format have float16 vectors and `scales` NULL.
+-- `levels` is the RMS of each window in dBFS.
 CREATE TABLE IF NOT EXISTS sound_fine (
     sound_id        INTEGER PRIMARY KEY REFERENCES sounds(id) ON DELETE CASCADE,
     window_seconds  REAL NOT NULL,
     offsets         REAL[] NOT NULL,
     levels          REAL[] NOT NULL,
-    vectors         BYTEA NOT NULL
+    vectors         BYTEA NOT NULL,
+    scales          BYTEA
 );
+ALTER TABLE sound_fine ADD COLUMN IF NOT EXISTS scales BYTEA;
 
 DROP VIEW IF EXISTS library_stats;
 CREATE VIEW library_stats AS

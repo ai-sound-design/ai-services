@@ -97,7 +97,9 @@ def main() -> int:
                            "educational and research use (https://sound-effects.bbcrewind.co.uk/licensing). It contains no audio.",
                 "text_embeddings": {"text_embedding": "X-CLIP base (microsoft/xclip-base-patch32), 512",
                                     "text_embedding_large": "X-CLIP large, 768"},
-                "audio_index": parameters(), "tables": {}}
+                "audio_index": parameters(),
+                "fine_vectors": "int8, one float16 scale per 2 s window (sound_fine.scales); float16 where scales is NULL",
+                "tables": {}}
     with psycopg2.connect(args.database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute("SELECT version()")

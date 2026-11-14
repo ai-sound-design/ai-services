@@ -46,11 +46,11 @@ INSERT_SEGMENT = """
         end_seconds = EXCLUDED.end_seconds, audio_embedding = EXCLUDED.audio_embedding
 """
 INSERT_FINE = """
-    INSERT INTO sound_fine (sound_id, window_seconds, offsets, levels, vectors)
-    VALUES (%s, %s, %s, %s, %s)
+    INSERT INTO sound_fine (sound_id, window_seconds, offsets, levels, vectors, scales)
+    VALUES (%s, %s, %s, %s, %s, %s)
     ON CONFLICT (sound_id) DO UPDATE SET
         window_seconds = EXCLUDED.window_seconds, offsets = EXCLUDED.offsets,
-        levels = EXCLUDED.levels, vectors = EXCLUDED.vectors
+        levels = EXCLUDED.levels, vectors = EXCLUDED.vectors, scales = EXCLUDED.scales
 """
 
 
@@ -128,8 +128,9 @@ def embed_pending(connection, library: str | None = None, rebuild: bool = False,
                 execute_batch(cursor, INSERT_SEGMENT,
                               [(sound_id, start, end, str([round(float(x), 5) for x in vector]))
                                for start, end, vector in found], page_size=200)
+                packed, scales = audio.pack_fine(vectors)
                 cursor.execute(INSERT_FINE, (sound_id, audio.FINE_SECONDS, [float(o) for o in offsets], levels,
-                                             vectors.astype(np.float16).tobytes()))
+                                             packed, scales))
             connection.commit()
             done_files += 1
             done_segments += len(found)

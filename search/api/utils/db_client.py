@@ -13,7 +13,7 @@ from typing import Any, Optional
 import numpy as np
 from psycopg2.extras import RealDictCursor
 
-from common import db
+from common import audio, db
 
 logger = logging.getLogger(__name__)
 
@@ -169,13 +169,13 @@ class DatabaseClient:
         """The 2 s windows of one sound from the adaptive index: window_seconds, offsets,
         levels (dBFS) and vectors (float32, one row per window); None if not indexed."""
         with self.conn.cursor() as cursor:
-            cursor.execute("SELECT window_seconds, offsets, levels, vectors FROM sound_fine WHERE sound_id = %s",
+            cursor.execute("SELECT window_seconds, offsets, levels, vectors, scales FROM sound_fine WHERE sound_id = %s",
                            (sound_id,))
             row = cursor.fetchone()
         if not row:
             return None
         offsets = np.asarray(row[1], dtype=np.float32)
-        vectors = np.frombuffer(bytes(row[3]), dtype=np.float16).astype(np.float32).reshape(len(offsets), -1)
+        vectors = audio.unpack_fine(row[3], row[4], len(offsets))
         return {"window_seconds": float(row[0]), "offsets": offsets,
                 "levels": np.asarray(row[2], dtype=np.float32), "vectors": vectors}
 

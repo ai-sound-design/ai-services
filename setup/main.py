@@ -84,7 +84,7 @@ SERVICES = [
 STEPS: dict[str, dict[str, Any]] = {
     "bbc_index": {"title": "BBC Sound Effects: prebuilt index",
                   "about": "The archive's records, their text embeddings and the audio index (segment vectors of "
-                           "every recording), fetched from Hugging Face (about 6 GB, no audio) and merged into the "
+                           "every recording), fetched from Hugging Face (about 2.5 GB, no audio) and merged into the "
                            "database: searchable by video, prompt and sound in minutes, instead of a 60 GB "
                            "download and hours of indexing. A recording is fetched when it is used. Free for "
                            "personal, educational and research use under the BBC's terms.",

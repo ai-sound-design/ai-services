@@ -36,8 +36,9 @@ handful, so a one-second event is found by a vector of its own length instead
 of drowning in a 10 s window: on 343 BBC sounds a 1 s excerpt found its
 recording first 77 % of the time against 57 % with the windows, with 18 % more
 rows (halfvec halves them). The 2 s windows themselves are kept per sound,
-unindexed, so `refine` picks the best window without running CLAP over the
-file again and only scores the stretches inside it. `AUDIO_INDEX` chooses:
+unindexed and as int8 with a float16 scale per window (half of float16, the
+same rankings), so `refine` picks the best window without running CLAP over
+the file again and only scores the stretches inside it. `AUDIO_INDEX` chooses:
 `auto` (the default) uses the segments once every sound with windows has them,
 `segments` or `windows` force one; a request's `index` field overrides it.
 
